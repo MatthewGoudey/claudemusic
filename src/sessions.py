@@ -44,15 +44,17 @@ def detect_sessions(
         gap = (curr_time - prev_time).total_seconds()
 
         if gap > gap_seconds:
-            # Finalize current session
-            sessions.append(_build_session(current_session_listens, total_tracks))
+            session = _build_session(current_session_listens, total_tracks)
+            if session is not None:
+                sessions.append(session)
             current_session_listens = [listens[i]]
         else:
             current_session_listens.append(listens[i])
 
-    # Finalize last session
     if current_session_listens:
-        sessions.append(_build_session(current_session_listens, total_tracks))
+        session = _build_session(current_session_listens, total_tracks)
+        if session is not None:
+            sessions.append(session)
 
     return sessions
 
@@ -69,7 +71,16 @@ def _build_session(listens: list[dict], total_tracks: int) -> dict:
     if isinstance(end, str):
         end = datetime.fromisoformat(end)
 
-    session_type = "full" if completion >= 0.8 else "partial"
+    # Classification:
+    #   full:    completion >= 0.8
+    #   partial: completion >= 0.25 AND tracks >= 3
+    #   discard: below threshold (not a real session)
+    if completion >= 0.8:
+        session_type = "full"
+    elif completion >= 0.25 and distinct_tracks >= 3:
+        session_type = "partial"
+    else:
+        return None  # Below threshold — not a session
 
     return {
         "session_start": start.isoformat(),
