@@ -8,6 +8,7 @@ Rate limited to 1 request/second per MB API terms.
 import re
 import asyncio
 import logging
+import statistics
 from datetime import datetime, timezone
 
 import httpx
@@ -33,8 +34,9 @@ async def resolve_album_tracklist(
 ) -> int | None:
     """Query MusicBrainz for an album's track count.
 
-    Returns the lowest track count among standard (non-deluxe) releases,
-    or None if no match found.
+    Filters to primary-type=Album release groups only (excludes singles, EPs,
+    compilations). Applies a minimum track count floor of 5 and uses the median
+    track count across standard releases.
     """
     query = f'release:{album} AND artist:{artist}'
     params = {"query": query, "fmt": "json", "limit": "10"}
@@ -55,13 +57,22 @@ async def resolve_album_tracklist(
     if not release_groups:
         return None
 
-    # Take the top-scoring release group
-    rg = release_groups[0]
+    # Find the first release group with primary-type "Album"
+    rg = None
+    for candidate in release_groups:
+        primary_type = candidate.get("primary-type", "")
+        if primary_type == "Album":
+            rg = candidate
+            break
+
+    # If no Album type found, skip — don't match singles/EPs/compilations
+    if rg is None:
+        return None
+
     rg_id = rg.get("id")
     if not rg_id:
         return None
 
-    # Get releases for this release group
     await asyncio.sleep(1.1)  # Rate limit
     try:
         resp = await client.get(
@@ -78,7 +89,7 @@ async def resolve_album_tracklist(
     if not releases:
         return None
 
-    # Filter out deluxe/expanded editions and find lowest track count
+    # Collect track counts, excluding deluxe editions and releases with < 5 tracks
     track_counts = []
     for release in releases:
         title = release.get("title", "")
@@ -86,18 +97,21 @@ async def resolve_album_tracklist(
             continue
         media = release.get("media", [])
         total = sum(m.get("track-count", 0) for m in media)
-        if total > 0:
+        if total >= 5:
             track_counts.append(total)
 
-    # If all were excluded, try unfiltered
+    # Fallback: if all were excluded by edition filter, try unfiltered (still with floor)
     if not track_counts:
         for release in releases:
             media = release.get("media", [])
             total = sum(m.get("track-count", 0) for m in media)
-            if total > 0:
+            if total >= 5:
                 track_counts.append(total)
 
-    return min(track_counts) if track_counts else None
+    if not track_counts:
+        return None
+
+    return int(statistics.median(track_counts))
 
 
 async def resolve_single(artist: str, album: str) -> dict:
@@ -123,6 +137,9 @@ async def resolve_single(artist: str, album: str) -> dict:
 
 async def resolve_all_missing() -> dict:
     """Resolve all albums in listen_events that aren't in album_tracklist."""
+    # Clean up bad matches from previous runs (singles/EPs that slipped through)
+    await execute("DELETE FROM album_tracklist WHERE track_count < 5")
+
     # Find unresolved albums
     unresolved = await fetch("""
         SELECT DISTINCT le.raw_artist, le.raw_album
