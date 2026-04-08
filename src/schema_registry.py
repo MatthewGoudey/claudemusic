@@ -113,7 +113,7 @@ SCHEMA = {
         {
             "route": "/api/album-sessions",
             "method": "GET",
-            "description": "Detected full and partial album listening sessions",
+            "description": "Detected full and partial album listening sessions (precomputed)",
             "params": {
                 "artist": {"type": "string", "required": False},
                 "album": {"type": "string", "required": False},
@@ -122,8 +122,19 @@ SCHEMA = {
                 "days": {"type": "int", "required": False},
                 "min_completion": {"type": "float 0-1", "required": False, "default": 0.0},
                 "session_type": {"type": "string", "required": False, "enum": ["full", "partial"]},
-                "gap_minutes": {"type": "int", "required": False, "default": 30},
                 "limit": {"type": "int", "required": False, "default": 50, "max": 1000},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/album-sessions/stats",
+            "method": "GET",
+            "description": "Aggregate session stats: totals, by-year breakdown, top 25 albums by full sessions",
+            "params": {
+                "start_date": {"type": "ISO date string", "required": False},
+                "end_date": {"type": "ISO date string", "required": False},
+                "days": {"type": "int", "required": False},
+                "session_type": {"type": "string", "required": False, "enum": ["full", "partial"]},
             },
             "auth": True,
         },

@@ -15,7 +15,6 @@ from pydantic import BaseModel
 from src.database import get_pool, get_ro_pool, close_pools, fetch, fetchrow, fetchval, fetch_ro, execute
 from src.auth import verify_key
 from src.filters import parse_date_filter, DateFilter
-from src.sessions import detect_sessions
 from src.musicbrainz import resolve_single, resolve_all_missing, get_resolution_status
 from src.schema_registry import SCHEMA
 
@@ -398,7 +397,7 @@ async def album_completion(
 
 
 # ============================================================
-# Album sessions
+# Album sessions (precomputed)
 # ============================================================
 
 @app.get("/api/album-sessions")
@@ -410,90 +409,115 @@ async def album_sessions(
     days: Optional[int] = None,
     min_completion: Optional[float] = Query(default=0.0),
     session_type: Optional[str] = Query(default=None, pattern="^(full|partial)$"),
-    gap_minutes: int = Query(default=30),
     limit: int = Query(default=50, le=1000),
     _=Depends(verify_key),
 ):
     df = _df(start_date, end_date, days, limit)
-    clauses, params = df.build_where(col="le.listened_at")
-    clauses.append("le.raw_album IS NOT NULL")
+    clauses, params = df.build_where(col="session_start")
 
     if artist:
         idx = len(params) + 1
-        clauses.append(f"LOWER(le.raw_artist) = LOWER(${idx})")
+        clauses.append(f"LOWER(raw_artist) = LOWER(${idx})")
         params.append(artist)
     if album:
         idx = len(params) + 1
-        clauses.append(f"LOWER(le.raw_album) = LOWER(${idx})")
+        clauses.append(f"LOWER(raw_album) = LOWER(${idx})")
         params.append(album)
+    if min_completion is not None and min_completion > 0:
+        idx = len(params) + 1
+        clauses.append(f"completion >= ${idx}")
+        params.append(min_completion)
+    if session_type:
+        idx = len(params) + 1
+        clauses.append(f"session_type = ${idx}")
+        params.append(session_type)
 
-    where = "WHERE " + " AND ".join(clauses)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    idx = len(params) + 1
 
-    # Get distinct artist+album pairs in the filtered range
-    album_pairs = await fetch(f"""
-        SELECT DISTINCT le.raw_artist, le.raw_album
-        FROM listen_events le
+    rows = await fetch(f"""
+        SELECT raw_artist, raw_album, session_start, session_end,
+               tracks_played, total_tracks, completion, session_type, tracklist_source
+        FROM album_sessions
         {where}
-        ORDER BY le.raw_artist, le.raw_album
-    """, *params)
-
-    all_sessions = []
-
-    for pair in album_pairs:
-        a_artist = pair["raw_artist"]
-        a_album = pair["raw_album"]
-
-        # Get all listens for this album pair (within date range)
-        listen_clauses, listen_params = df.build_where()
-        listen_clauses.append("LOWER(raw_artist) = LOWER($" + str(len(listen_params) + 1) + ")")
-        listen_params.append(a_artist)
-        listen_clauses.append("LOWER(raw_album) = LOWER($" + str(len(listen_params) + 1) + ")")
-        listen_params.append(a_album)
-
-        listen_where = "WHERE " + " AND ".join(listen_clauses)
-
-        listens = await fetch(f"""
-            SELECT raw_title, listened_at
-            FROM listen_events
-            {listen_where}
-            ORDER BY listened_at ASC
-        """, *listen_params)
-
-        if not listens:
-            continue
-
-        total_tracks, source = await _get_album_track_count(a_artist, a_album)
-        if total_tracks == 0:
-            continue
-
-        sessions = detect_sessions(listens, total_tracks, gap_minutes)
-
-        for s in sessions:
-            if min_completion is not None and s["completion"] < min_completion:
-                continue
-            if session_type and s["session_type"] != session_type:
-                continue
-
-            all_sessions.append({
-                "raw_artist": a_artist,
-                "raw_album": a_album,
-                **s,
-                "tracklist_source": source,
-            })
-
-    # Sort by session_start descending, then limit
-    all_sessions.sort(key=lambda s: s["session_start"], reverse=True)
-    all_sessions = all_sessions[:df.limit]
+        ORDER BY session_start DESC
+        LIMIT ${idx}
+    """, *params, df.limit)
 
     return {
-        "sessions": all_sessions,
+        "sessions": rows,
         "filters": {
             **df.as_dict(),
             "artist": artist,
             "album": album,
             "min_completion": min_completion,
             "session_type": session_type,
-            "gap_minutes": gap_minutes,
+        },
+    }
+
+
+# ============================================================
+# Album sessions stats
+# ============================================================
+
+@app.get("/api/album-sessions/stats")
+async def album_sessions_stats(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    days: Optional[int] = None,
+    session_type: Optional[str] = Query(default=None, pattern="^(full|partial)$"),
+    _=Depends(verify_key),
+):
+    df = _df(start_date, end_date, days, limit=50)
+    clauses, params = df.build_where(col="session_start")
+
+    if session_type:
+        idx = len(params) + 1
+        clauses.append(f"session_type = ${idx}")
+        params.append(session_type)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    totals = await fetchrow(f"""
+        SELECT
+            COUNT(*) AS total_sessions,
+            COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
+            COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions,
+            COUNT(DISTINCT (raw_artist, raw_album)) AS unique_albums
+        FROM album_sessions
+        {where}
+    """, *params)
+
+    by_year = await fetch(f"""
+        SELECT
+            EXTRACT(YEAR FROM session_start)::int AS year,
+            COUNT(*) FILTER (WHERE session_type = 'full') AS full,
+            COUNT(*) FILTER (WHERE session_type = 'partial') AS partial
+        FROM album_sessions
+        {where}
+        GROUP BY year
+        ORDER BY year DESC
+    """, *params)
+
+    top_albums = await fetch(f"""
+        SELECT
+            raw_artist, raw_album,
+            COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
+            COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
+        FROM album_sessions
+        {where}
+        GROUP BY raw_artist, raw_album
+        ORDER BY full_sessions DESC
+        LIMIT 25
+    """, *params)
+
+    return {
+        **(totals or {}),
+        "by_year": by_year,
+        "top_albums": top_albums,
+        "filters": {
+            **df.as_dict(),
+            "session_type": session_type,
         },
     }
 
@@ -545,22 +569,23 @@ async def artists_batch(body: ArtistBatchRequest, _=Depends(verify_key)):
             ORDER BY listen_count DESC
         """, artist_name)
 
+        # Get session counts per album from precomputed table
+        session_counts = await fetch("""
+            SELECT raw_album,
+                   COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
+                   COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
+            FROM album_sessions
+            WHERE LOWER(raw_artist) = LOWER($1)
+            GROUP BY raw_album
+        """, artist_name)
+        session_map = {r["raw_album"]: r for r in session_counts}
+
         album_results = []
         for alb in albums:
             total_tracks, _ = await _get_album_track_count(artist_name, alb["raw_album"])
             completion = round(alb["tracks_heard"] / total_tracks, 2) if total_tracks > 0 else 0.0
 
-            # Get session counts for this album
-            listens = await fetch("""
-                SELECT raw_title, listened_at
-                FROM listen_events
-                WHERE LOWER(raw_artist) = LOWER($1) AND LOWER(raw_album) = LOWER($2)
-                ORDER BY listened_at ASC
-            """, artist_name, alb["raw_album"])
-
-            sessions = detect_sessions(listens, total_tracks) if total_tracks > 0 else []
-            full_sessions = sum(1 for s in sessions if s["session_type"] == "full")
-            partial_sessions = sum(1 for s in sessions if s["session_type"] == "partial")
+            sc = session_map.get(alb["raw_album"], {})
 
             album_results.append({
                 "raw_album": alb["raw_album"],
@@ -568,8 +593,8 @@ async def artists_batch(body: ArtistBatchRequest, _=Depends(verify_key)):
                 "total_tracks": total_tracks,
                 "completion": completion,
                 "listen_count": alb["listen_count"],
-                "full_sessions": full_sessions,
-                "partial_sessions": partial_sessions,
+                "full_sessions": sc.get("full_sessions", 0),
+                "partial_sessions": sc.get("partial_sessions", 0),
             })
 
         results.append({
