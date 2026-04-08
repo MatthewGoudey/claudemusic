@@ -1,84 +1,92 @@
 """
-Music Pipeline API — read-only endpoints for Claude to query via web_fetch.
-
-Deploy to Render/Railway/Vercel free tier. Claude can then call these
-endpoints from any conversation to see your listening data.
+Music Pipeline API — async read-only endpoints backed by asyncpg connection pool.
 
 Usage:
-    # Local dev
-    uvicorn src.api:app --reload --port 8000
-
-    # Then Claude can call:
-    # https://your-app.onrender.com/api/top-artists?days=30&limit=20
+    uvicorn api:app --reload --port 8000
 """
 
-import os
-from datetime import datetime, timezone
+import asyncio
+import logging
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, Query, Header
-from fastapi.responses import JSONResponse
-import psycopg2
-import psycopg2.extras
-from dotenv import load_dotenv
+from fastapi import FastAPI, Depends, HTTPException, Query
+from pydantic import BaseModel
 
-load_dotenv()
+from src.database import get_pool, get_ro_pool, close_pools, fetch, fetchrow, fetchval, fetch_ro, execute
+from src.auth import verify_key
+from src.filters import parse_date_filter, DateFilter
+from src.sessions import detect_sessions
+from src.musicbrainz import resolve_single, resolve_all_missing, get_resolution_status
+from src.schema_registry import SCHEMA
 
-app = FastAPI(title="Music Listening API", version="0.1.0")
+logger = logging.getLogger(__name__)
 
-# Simple API key auth — keeps your data private.
-# Set API_SECRET in your .env and pass it as ?key= or Authorization header.
-API_SECRET = os.environ.get("API_SECRET", "changeme")
-
-
-def verify_key(
-    key: Optional[str] = Query(None),
-    authorization: Optional[str] = Header(None),
-):
-    """Check API key from query param or Authorization header."""
-    token = key or (authorization.replace("Bearer ", "") if authorization else None)
-    if token != API_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return token
+app = FastAPI(title="Music Listening API", version="0.2.0")
 
 
-def get_conn():
-    """Get a database connection. Caller must close it."""
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        raise HTTPException(status_code=500, detail="DATABASE_URL not configured")
-    return psycopg2.connect(db_url)
+@app.on_event("startup")
+async def startup():
+    await get_pool()
 
 
-def run_query(sql: str, params: tuple = ()) -> list[dict]:
-    """Execute a read-only query and return results as list of dicts."""
-    conn = get_conn()
-    try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, params)
-            return [dict(row) for row in cur.fetchall()]
-    finally:
-        conn.close()
+@app.on_event("shutdown")
+async def shutdown():
+    await close_pools()
 
 
 # ============================================================
-# Health check
+# Helpers
+# ============================================================
+
+def _df(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    days: Optional[int] = None,
+    limit: int = 50,
+) -> DateFilter:
+    return parse_date_filter(start_date, end_date, days, limit)
+
+
+async def _get_album_track_count(artist: str, album: str) -> tuple[int, str]:
+    """Get track count from album_tracklist or fall back to heuristic.
+
+    Returns (track_count, source) where source is 'musicbrainz' or 'heuristic'.
+    """
+    row = await fetchrow(
+        "SELECT track_count FROM album_tracklist WHERE LOWER(raw_artist) = LOWER($1) AND LOWER(raw_album) = LOWER($2)",
+        artist, album,
+    )
+    if row:
+        return row["track_count"], "musicbrainz"
+
+    count = await fetchval(
+        "SELECT COUNT(DISTINCT raw_title) FROM listen_events WHERE LOWER(raw_artist) = LOWER($1) AND LOWER(raw_album) = LOWER($2)",
+        artist, album,
+    )
+    return count or 0, "heuristic"
+
+
+# ============================================================
+# Health + Schema (no auth)
 # ============================================================
 
 @app.get("/api/health")
-def health():
-    """No auth required — just confirms the API is running."""
+async def health():
     return {"status": "ok"}
 
 
+@app.get("/api/schema")
+async def schema():
+    return SCHEMA
+
+
 # ============================================================
-# Summary / overview
+# Summary
 # ============================================================
 
 @app.get("/api/summary")
-def summary(_=Depends(verify_key)):
-    """High-level stats about the entire dataset."""
-    rows = run_query("""
+async def summary(_=Depends(verify_key)):
+    rows = await fetch("""
         SELECT
             COUNT(*) AS total_listens,
             COUNT(DISTINCT raw_title || '|||' || raw_artist) AS unique_tracks,
@@ -89,7 +97,7 @@ def summary(_=Depends(verify_key)):
             COUNT(DISTINCT platform) AS platform_count
         FROM listen_events
     """)
-    platform_breakdown = run_query("""
+    platform_breakdown = await fetch("""
         SELECT platform, source_system, COUNT(*) AS count
         FROM listen_events
         GROUP BY platform, source_system
@@ -106,29 +114,19 @@ def summary(_=Depends(verify_key)):
 # ============================================================
 
 @app.get("/api/top-artists")
-def top_artists(
+async def top_artists(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     days: Optional[int] = None,
-    year: Optional[int] = None,
-    limit: int = Query(default=25, le=200),
+    limit: int = Query(default=50, le=1000),
     _=Depends(verify_key),
 ):
-    """
-    Top artists by listen count.
-    Filter by days (last N days) or year (specific year).
-    """
-    where = []
-    params = []
+    df = _df(start_date, end_date, days, limit)
+    clauses, params = df.build_where()
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    idx = len(params) + 1
 
-    if days:
-        where.append("listened_at > now() - interval '%s days'")
-        params.append(days)
-    elif year:
-        where.append("EXTRACT(YEAR FROM listened_at) = %s")
-        params.append(year)
-
-    where_clause = ("WHERE " + " AND ".join(where)) if where else ""
-
-    rows = run_query(f"""
+    rows = await fetch(f"""
         SELECT
             raw_artist,
             COUNT(*) AS listen_count,
@@ -137,12 +135,12 @@ def top_artists(
             MIN(listened_at) AS first_listen,
             MAX(listened_at) AS last_listen
         FROM listen_events
-        {where_clause}
+        {where}
         GROUP BY raw_artist
         ORDER BY listen_count DESC
-        LIMIT %s
-    """, tuple(params) + (limit,))
-    return {"artists": rows, "filters": {"days": days, "year": year}}
+        LIMIT ${idx}
+    """, *params, df.limit)
+    return {"artists": rows, "filters": df.as_dict()}
 
 
 # ============================================================
@@ -150,30 +148,26 @@ def top_artists(
 # ============================================================
 
 @app.get("/api/top-tracks")
-def top_tracks(
+async def top_tracks(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     days: Optional[int] = None,
-    year: Optional[int] = None,
     artist: Optional[str] = None,
-    limit: int = Query(default=25, le=200),
+    limit: int = Query(default=50, le=1000),
     _=Depends(verify_key),
 ):
-    """Top tracks by listen count."""
-    where = []
-    params = []
+    df = _df(start_date, end_date, days, limit)
+    clauses, params = df.build_where()
 
-    if days:
-        where.append("listened_at > now() - interval '%s days'")
-        params.append(days)
-    elif year:
-        where.append("EXTRACT(YEAR FROM listened_at) = %s")
-        params.append(year)
     if artist:
-        where.append("LOWER(raw_artist) = LOWER(%s)")
+        idx = len(params) + 1
+        clauses.append(f"LOWER(raw_artist) = LOWER(${idx})")
         params.append(artist)
 
-    where_clause = ("WHERE " + " AND ".join(where)) if where else ""
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    idx = len(params) + 1
 
-    rows = run_query(f"""
+    rows = await fetch(f"""
         SELECT
             raw_title,
             raw_artist,
@@ -182,12 +176,12 @@ def top_tracks(
             MIN(listened_at) AS first_listen,
             MAX(listened_at) AS last_listen
         FROM listen_events
-        {where_clause}
+        {where}
         GROUP BY raw_title, raw_artist, raw_album
         ORDER BY listen_count DESC
-        LIMIT %s
-    """, tuple(params) + (limit,))
-    return {"tracks": rows, "filters": {"days": days, "year": year, "artist": artist}}
+        LIMIT ${idx}
+    """, *params, df.limit)
+    return {"tracks": rows, "filters": {**df.as_dict(), "artist": artist}}
 
 
 # ============================================================
@@ -195,30 +189,27 @@ def top_tracks(
 # ============================================================
 
 @app.get("/api/top-albums")
-def top_albums(
+async def top_albums(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     days: Optional[int] = None,
-    year: Optional[int] = None,
     artist: Optional[str] = None,
-    limit: int = Query(default=25, le=200),
+    limit: int = Query(default=50, le=1000),
     _=Depends(verify_key),
 ):
-    """Top albums by listen count."""
-    where = ["raw_album IS NOT NULL"]
-    params = []
+    df = _df(start_date, end_date, days, limit)
+    clauses, params = df.build_where()
+    clauses.append("raw_album IS NOT NULL")
 
-    if days:
-        where.append("listened_at > now() - interval '%s days'")
-        params.append(days)
-    elif year:
-        where.append("EXTRACT(YEAR FROM listened_at) = %s")
-        params.append(year)
     if artist:
-        where.append("LOWER(raw_artist) = LOWER(%s)")
+        idx = len(params) + 1
+        clauses.append(f"LOWER(raw_artist) = LOWER(${idx})")
         params.append(artist)
 
-    where_clause = "WHERE " + " AND ".join(where)
+    where = "WHERE " + " AND ".join(clauses)
+    idx = len(params) + 1
 
-    rows = run_query(f"""
+    rows = await fetch(f"""
         SELECT
             raw_album,
             raw_artist,
@@ -227,58 +218,42 @@ def top_albums(
             MIN(listened_at) AS first_listen,
             MAX(listened_at) AS last_listen
         FROM listen_events
-        {where_clause}
+        {where}
         GROUP BY raw_album, raw_artist
         ORDER BY listen_count DESC
-        LIMIT %s
-    """, tuple(params) + (limit,))
-    return {"albums": rows, "filters": {"days": days, "year": year, "artist": artist}}
+        LIMIT ${idx}
+    """, *params, df.limit)
+    return {"albums": rows, "filters": {**df.as_dict(), "artist": artist}}
 
 
 # ============================================================
-# Listening timeline
+# Timeline
 # ============================================================
 
 @app.get("/api/timeline")
-def timeline(
-    granularity: str = Query(default="month", regex="^(day|week|month|year)$"),
+async def timeline(
+    granularity: str = Query(default="month", pattern="^(day|week|month|year)$"),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     days: Optional[int] = None,
-    year: Optional[int] = None,
     _=Depends(verify_key),
 ):
-    """Listen counts over time at day/week/month/year granularity."""
-    trunc_map = {
-        "day": "day",
-        "week": "week",
-        "month": "month",
-        "year": "year",
-    }
-    trunc = trunc_map[granularity]
+    df = _df(start_date, end_date, days, limit=50)  # limit not used for timeline
+    clauses, params = df.build_where()
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
-    where = []
-    params = []
-
-    if days:
-        where.append("listened_at > now() - interval '%s days'")
-        params.append(days)
-    elif year:
-        where.append("EXTRACT(YEAR FROM listened_at) = %s")
-        params.append(year)
-
-    where_clause = ("WHERE " + " AND ".join(where)) if where else ""
-
-    rows = run_query(f"""
+    rows = await fetch(f"""
         SELECT
-            DATE_TRUNC('{trunc}', listened_at) AS period,
+            DATE_TRUNC('{granularity}', listened_at) AS period,
             COUNT(*) AS listen_count,
             COUNT(DISTINCT raw_artist) AS unique_artists,
             COUNT(DISTINCT raw_title || '|||' || raw_artist) AS unique_tracks
         FROM listen_events
-        {where_clause}
+        {where}
         GROUP BY period
         ORDER BY period
-    """, tuple(params))
-    return {"timeline": rows, "granularity": granularity}
+    """, *params)
+    return {"timeline": rows, "granularity": granularity, "filters": df.as_dict()}
 
 
 # ============================================================
@@ -286,102 +261,18 @@ def timeline(
 # ============================================================
 
 @app.get("/api/recent")
-def recent(
+async def recent(
     limit: int = Query(default=50, le=500),
     _=Depends(verify_key),
 ):
-    """Most recent listens."""
-    rows = run_query("""
+    rows = await fetch("""
         SELECT raw_title, raw_artist, raw_album, platform, source_app,
                listened_at, content_type, confidence
         FROM listen_events
         ORDER BY listened_at DESC
-        LIMIT %s
-    """, (limit,))
+        LIMIT $1
+    """, limit)
     return {"listens": rows}
-
-
-# ============================================================
-# Full album listens
-# ============================================================
-
-@app.get("/api/full-album-listens")
-def full_album_listens(
-    days: Optional[int] = None,
-    year: Optional[int] = None,
-    threshold: float = Query(default=0.8, ge=0.5, le=1.0),
-    max_gap_minutes: int = Query(default=120),
-    limit: int = Query(default=50, le=200),
-    _=Depends(verify_key),
-):
-    """
-    Detect full album listens — sessions where you played >= threshold
-    of an album's tracks within a time window.
-
-    This is a heuristic: groups listens by (raw_artist, raw_album),
-    finds clusters where consecutive tracks are within max_gap_minutes
-    of each other, and checks if the cluster covers >= threshold of
-    the album's known tracks.
-
-    Note: accuracy improves as track resolution progresses, since
-    album_tracks gives the true track count. For now, we estimate
-    album size from the max distinct tracks we've ever seen for that album.
-    """
-    where = ["raw_album IS NOT NULL"]
-    params = []
-
-    if days:
-        where.append("listened_at > now() - interval '%s days'")
-        params.append(days)
-    elif year:
-        where.append("EXTRACT(YEAR FROM listened_at) = %s")
-        params.append(year)
-
-    where_clause = "WHERE " + " AND ".join(where)
-
-    # This query finds albums where we played a high proportion of tracks
-    # in a single session (approximated by same day).
-    rows = run_query(f"""
-        WITH album_sizes AS (
-            SELECT raw_artist, raw_album,
-                   COUNT(DISTINCT raw_title) AS total_tracks
-            FROM listen_events
-            WHERE raw_album IS NOT NULL
-            GROUP BY raw_artist, raw_album
-        ),
-        daily_album_plays AS (
-            SELECT
-                e.raw_artist,
-                e.raw_album,
-                DATE(e.listened_at) AS listen_date,
-                COUNT(DISTINCT e.raw_title) AS tracks_played,
-                MIN(e.listened_at) AS session_start,
-                MAX(e.listened_at) AS session_end,
-                ARRAY_AGG(DISTINCT e.raw_title ORDER BY e.raw_title) AS tracks
-            FROM listen_events e
-            {where_clause}
-            GROUP BY e.raw_artist, e.raw_album, DATE(e.listened_at)
-        )
-        SELECT
-            d.raw_artist,
-            d.raw_album,
-            d.listen_date,
-            d.tracks_played,
-            a.total_tracks AS album_total_tracks,
-            ROUND(d.tracks_played::numeric / NULLIF(a.total_tracks, 0), 2) AS completion,
-            d.session_start,
-            d.session_end
-        FROM daily_album_plays d
-        JOIN album_sizes a ON a.raw_artist = d.raw_artist AND a.raw_album = d.raw_album
-        WHERE a.total_tracks >= 3
-          AND d.tracks_played::numeric / NULLIF(a.total_tracks, 0) >= %s
-        ORDER BY d.listen_date DESC
-        LIMIT %s
-    """, tuple(params) + (threshold, limit))
-    return {
-        "full_album_listens": rows,
-        "filters": {"days": days, "year": year, "threshold": threshold},
-    }
 
 
 # ============================================================
@@ -389,38 +280,34 @@ def full_album_listens(
 # ============================================================
 
 @app.get("/api/artist/{artist_name}")
-def artist_detail(
-    artist_name: str,
-    _=Depends(verify_key),
-):
-    """Detailed stats for a specific artist."""
-    listens = run_query("""
+async def artist_detail(artist_name: str, _=Depends(verify_key)):
+    listens = await fetch("""
         SELECT COUNT(*) AS total_listens,
                COUNT(DISTINCT raw_title) AS unique_tracks,
                COUNT(DISTINCT raw_album) FILTER (WHERE raw_album IS NOT NULL) AS unique_albums,
                MIN(listened_at) AS first_listen,
                MAX(listened_at) AS last_listen
         FROM listen_events
-        WHERE LOWER(raw_artist) = LOWER(%s)
-    """, (artist_name,))
+        WHERE LOWER(raw_artist) = LOWER($1)
+    """, artist_name)
 
-    top_tracks = run_query("""
+    top_tracks = await fetch("""
         SELECT raw_title, raw_album, COUNT(*) AS listen_count
         FROM listen_events
-        WHERE LOWER(raw_artist) = LOWER(%s)
+        WHERE LOWER(raw_artist) = LOWER($1)
         GROUP BY raw_title, raw_album
         ORDER BY listen_count DESC
         LIMIT 20
-    """, (artist_name,))
+    """, artist_name)
 
-    by_year = run_query("""
+    by_year = await fetch("""
         SELECT EXTRACT(YEAR FROM listened_at)::int AS year,
                COUNT(*) AS listen_count
         FROM listen_events
-        WHERE LOWER(raw_artist) = LOWER(%s)
+        WHERE LOWER(raw_artist) = LOWER($1)
         GROUP BY year
         ORDER BY year
-    """, (artist_name,))
+    """, artist_name)
 
     return {
         "artist": artist_name,
@@ -431,42 +318,324 @@ def artist_detail(
 
 
 # ============================================================
-# Ad-hoc query (power user — run arbitrary read-only SQL)
+# Album completion
+# ============================================================
+
+@app.get("/api/album-completion")
+async def album_completion(
+    artist: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    days: Optional[int] = None,
+    min_completion: Optional[float] = None,
+    max_completion: Optional[float] = None,
+    limit: int = Query(default=50, le=1000),
+    _=Depends(verify_key),
+):
+    df = _df(start_date, end_date, days, limit)
+    clauses, params = df.build_where()
+    clauses.append("le.raw_album IS NOT NULL")
+
+    if artist:
+        idx = len(params) + 1
+        clauses.append(f"LOWER(le.raw_artist) = LOWER(${idx})")
+        params.append(artist)
+
+    where = "WHERE " + " AND ".join(clauses)
+
+    # Get distinct albums with their heard tracks and listen counts
+    albums = await fetch(f"""
+        SELECT
+            le.raw_artist,
+            le.raw_album,
+            COUNT(DISTINCT le.raw_title) AS tracks_heard,
+            COUNT(*) AS total_listens,
+            MIN(le.listened_at) AS first_listen,
+            MAX(le.listened_at) AS last_listen
+        FROM listen_events le
+        {where}
+        GROUP BY le.raw_artist, le.raw_album
+        ORDER BY total_listens DESC
+    """, *params)
+
+    results = []
+    for album in albums:
+        total_tracks, source = await _get_album_track_count(album["raw_artist"], album["raw_album"])
+        if total_tracks == 0:
+            continue
+
+        completion = round(album["tracks_heard"] / total_tracks, 2)
+
+        if min_completion is not None and completion < min_completion:
+            continue
+        if max_completion is not None and completion > max_completion:
+            continue
+
+        results.append({
+            "raw_artist": album["raw_artist"],
+            "raw_album": album["raw_album"],
+            "tracks_heard": album["tracks_heard"],
+            "total_tracks": total_tracks,
+            "completion": completion,
+            "total_listens": album["total_listens"],
+            "first_listen": album["first_listen"].isoformat() if album["first_listen"] else None,
+            "last_listen": album["last_listen"].isoformat() if album["last_listen"] else None,
+            "tracklist_source": source,
+        })
+
+        if len(results) >= df.limit:
+            break
+
+    return {
+        "albums": results,
+        "filters": {
+            **df.as_dict(),
+            "artist": artist,
+            "min_completion": min_completion,
+            "max_completion": max_completion,
+        },
+    }
+
+
+# ============================================================
+# Album sessions
+# ============================================================
+
+@app.get("/api/album-sessions")
+async def album_sessions(
+    artist: Optional[str] = None,
+    album: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    days: Optional[int] = None,
+    min_completion: Optional[float] = Query(default=0.0),
+    session_type: Optional[str] = Query(default=None, pattern="^(full|partial)$"),
+    gap_minutes: int = Query(default=30),
+    limit: int = Query(default=50, le=1000),
+    _=Depends(verify_key),
+):
+    df = _df(start_date, end_date, days, limit)
+    clauses, params = df.build_where(col="le.listened_at")
+    clauses.append("le.raw_album IS NOT NULL")
+
+    if artist:
+        idx = len(params) + 1
+        clauses.append(f"LOWER(le.raw_artist) = LOWER(${idx})")
+        params.append(artist)
+    if album:
+        idx = len(params) + 1
+        clauses.append(f"LOWER(le.raw_album) = LOWER(${idx})")
+        params.append(album)
+
+    where = "WHERE " + " AND ".join(clauses)
+
+    # Get distinct artist+album pairs in the filtered range
+    album_pairs = await fetch(f"""
+        SELECT DISTINCT le.raw_artist, le.raw_album
+        FROM listen_events le
+        {where}
+        ORDER BY le.raw_artist, le.raw_album
+    """, *params)
+
+    all_sessions = []
+
+    for pair in album_pairs:
+        a_artist = pair["raw_artist"]
+        a_album = pair["raw_album"]
+
+        # Get all listens for this album pair (within date range)
+        listen_clauses, listen_params = df.build_where()
+        listen_clauses.append("LOWER(raw_artist) = LOWER($" + str(len(listen_params) + 1) + ")")
+        listen_params.append(a_artist)
+        listen_clauses.append("LOWER(raw_album) = LOWER($" + str(len(listen_params) + 1) + ")")
+        listen_params.append(a_album)
+
+        listen_where = "WHERE " + " AND ".join(listen_clauses)
+
+        listens = await fetch(f"""
+            SELECT raw_title, listened_at
+            FROM listen_events
+            {listen_where}
+            ORDER BY listened_at ASC
+        """, *listen_params)
+
+        if not listens:
+            continue
+
+        total_tracks, source = await _get_album_track_count(a_artist, a_album)
+        if total_tracks == 0:
+            continue
+
+        sessions = detect_sessions(listens, total_tracks, gap_minutes)
+
+        for s in sessions:
+            if min_completion is not None and s["completion"] < min_completion:
+                continue
+            if session_type and s["session_type"] != session_type:
+                continue
+
+            all_sessions.append({
+                "raw_artist": a_artist,
+                "raw_album": a_album,
+                **s,
+                "tracklist_source": source,
+            })
+
+    # Sort by session_start descending, then limit
+    all_sessions.sort(key=lambda s: s["session_start"], reverse=True)
+    all_sessions = all_sessions[:df.limit]
+
+    return {
+        "sessions": all_sessions,
+        "filters": {
+            **df.as_dict(),
+            "artist": artist,
+            "album": album,
+            "min_completion": min_completion,
+            "session_type": session_type,
+            "gap_minutes": gap_minutes,
+        },
+    }
+
+
+# ============================================================
+# Artists batch
+# ============================================================
+
+class ArtistBatchRequest(BaseModel):
+    artists: list[str]
+
+
+@app.post("/api/artists/batch")
+async def artists_batch(body: ArtistBatchRequest, _=Depends(verify_key)):
+    results = []
+
+    for artist_name in body.artists:
+        # Basic stats
+        stats = await fetchrow("""
+            SELECT COUNT(*) AS total_listens,
+                   COUNT(DISTINCT raw_title) AS unique_tracks,
+                   COUNT(DISTINCT raw_album) FILTER (WHERE raw_album IS NOT NULL) AS unique_albums,
+                   MIN(listened_at) AS first_listen,
+                   MAX(listened_at) AS last_listen
+            FROM listen_events
+            WHERE LOWER(raw_artist) = LOWER($1)
+        """, artist_name)
+
+        if not stats or stats["total_listens"] == 0:
+            results.append({
+                "artist": artist_name,
+                "total_listens": 0,
+                "unique_tracks": 0,
+                "unique_albums": 0,
+                "first_listen": None,
+                "last_listen": None,
+                "albums": [],
+            })
+            continue
+
+        # Get albums for this artist
+        albums = await fetch("""
+            SELECT raw_album,
+                   COUNT(DISTINCT raw_title) AS tracks_heard,
+                   COUNT(*) AS listen_count
+            FROM listen_events
+            WHERE LOWER(raw_artist) = LOWER($1) AND raw_album IS NOT NULL
+            GROUP BY raw_album
+            ORDER BY listen_count DESC
+        """, artist_name)
+
+        album_results = []
+        for alb in albums:
+            total_tracks, _ = await _get_album_track_count(artist_name, alb["raw_album"])
+            completion = round(alb["tracks_heard"] / total_tracks, 2) if total_tracks > 0 else 0.0
+
+            # Get session counts for this album
+            listens = await fetch("""
+                SELECT raw_title, listened_at
+                FROM listen_events
+                WHERE LOWER(raw_artist) = LOWER($1) AND LOWER(raw_album) = LOWER($2)
+                ORDER BY listened_at ASC
+            """, artist_name, alb["raw_album"])
+
+            sessions = detect_sessions(listens, total_tracks) if total_tracks > 0 else []
+            full_sessions = sum(1 for s in sessions if s["session_type"] == "full")
+            partial_sessions = sum(1 for s in sessions if s["session_type"] == "partial")
+
+            album_results.append({
+                "raw_album": alb["raw_album"],
+                "tracks_heard": alb["tracks_heard"],
+                "total_tracks": total_tracks,
+                "completion": completion,
+                "listen_count": alb["listen_count"],
+                "full_sessions": full_sessions,
+                "partial_sessions": partial_sessions,
+            })
+
+        results.append({
+            "artist": artist_name,
+            "total_listens": stats["total_listens"],
+            "unique_tracks": stats["unique_tracks"],
+            "unique_albums": stats["unique_albums"],
+            "first_listen": stats["first_listen"].isoformat() if stats["first_listen"] else None,
+            "last_listen": stats["last_listen"].isoformat() if stats["last_listen"] else None,
+            "albums": album_results,
+        })
+
+    return {"results": results}
+
+
+# ============================================================
+# Album tracklist resolver
+# ============================================================
+
+class ResolverRequest(BaseModel):
+    artist: Optional[str] = None
+    album: Optional[str] = None
+
+
+@app.post("/api/album-tracklist-resolver")
+async def trigger_resolver(body: ResolverRequest = ResolverRequest(), _=Depends(verify_key)):
+    if body.artist and body.album:
+        result = await resolve_single(body.artist, body.album)
+        return {
+            "resolved": 1 if result["status"] == "resolved" else 0,
+            "failed": 1 if result["status"] == "failed" else 0,
+            "already_cached": 0,
+            "failures": [result] if result["status"] == "failed" else [],
+        }
+    else:
+        return await resolve_all_missing()
+
+
+@app.get("/api/album-tracklist-resolver")
+async def resolver_status(_=Depends(verify_key)):
+    return await get_resolution_status()
+
+
+# ============================================================
+# Ad-hoc query (secured with read-only DB role)
 # ============================================================
 
 @app.post("/api/query")
-def adhoc_query(
-    body: dict,
-    _=Depends(verify_key),
-):
-    """
-    Run an arbitrary read-only SQL query.
-
-    Body: {"sql": "SELECT ...", "limit": 100}
-
-    Safety: only SELECT statements allowed.
-    """
+async def adhoc_query(body: dict, _=Depends(verify_key)):
     sql = body.get("sql", "").strip()
     limit = body.get("limit", 100)
 
     if not sql:
         raise HTTPException(status_code=400, detail="Missing 'sql' field")
 
-    # Basic safety — only allow SELECT
     first_word = sql.split()[0].upper() if sql.split() else ""
     if first_word not in ("SELECT", "WITH", "EXPLAIN"):
         raise HTTPException(status_code=400, detail="Only SELECT queries allowed")
 
-    # Prevent destructive keywords anywhere in the query
-    dangerous = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE", "GRANT", "REVOKE"]
     sql_upper = sql.upper()
-    for word in dangerous:
-        if word in sql_upper:
-            raise HTTPException(status_code=400, detail=f"Query contains forbidden keyword: {word}")
-
-    # Add limit if not present
     if "LIMIT" not in sql_upper:
-        sql = sql.rstrip(";") + f" LIMIT {limit}"
+        sql = sql.rstrip(";") + f" LIMIT {int(limit)}"
 
-    rows = run_query(sql)
+    try:
+        rows = await fetch_ro(sql)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     return {"results": rows, "count": len(rows)}

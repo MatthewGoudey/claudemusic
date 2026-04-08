@@ -1,0 +1,159 @@
+"""
+Endpoint metadata for GET /api/schema.
+
+Manually maintained alongside actual endpoint definitions.
+"""
+
+SCHEMA = {
+    "endpoints": [
+        {
+            "route": "/api/health",
+            "method": "GET",
+            "description": "Health check — confirms the API is running",
+            "params": {},
+            "auth": False,
+        },
+        {
+            "route": "/api/schema",
+            "method": "GET",
+            "description": "Describes every endpoint in the API with params and types",
+            "params": {},
+            "auth": False,
+        },
+        {
+            "route": "/api/summary",
+            "method": "GET",
+            "description": "High-level stats: total listens, unique tracks/artists, platform breakdown",
+            "params": {},
+            "auth": True,
+        },
+        {
+            "route": "/api/top-artists",
+            "method": "GET",
+            "description": "Top artists by listen count",
+            "params": {
+                "start_date": {"type": "ISO date string", "required": False},
+                "end_date": {"type": "ISO date string", "required": False},
+                "days": {"type": "int", "required": False},
+                "limit": {"type": "int", "required": False, "default": 50, "max": 1000},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/top-tracks",
+            "method": "GET",
+            "description": "Top tracks by listen count",
+            "params": {
+                "artist": {"type": "string", "required": False},
+                "start_date": {"type": "ISO date string", "required": False},
+                "end_date": {"type": "ISO date string", "required": False},
+                "days": {"type": "int", "required": False},
+                "limit": {"type": "int", "required": False, "default": 50, "max": 1000},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/top-albums",
+            "method": "GET",
+            "description": "Top albums by listen count",
+            "params": {
+                "artist": {"type": "string", "required": False},
+                "start_date": {"type": "ISO date string", "required": False},
+                "end_date": {"type": "ISO date string", "required": False},
+                "days": {"type": "int", "required": False},
+                "limit": {"type": "int", "required": False, "default": 50, "max": 1000},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/timeline",
+            "method": "GET",
+            "description": "Listen counts over time at day/week/month/year granularity",
+            "params": {
+                "granularity": {"type": "string", "required": False, "default": "month", "enum": ["day", "week", "month", "year"]},
+                "start_date": {"type": "ISO date string", "required": False},
+                "end_date": {"type": "ISO date string", "required": False},
+                "days": {"type": "int", "required": False},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/recent",
+            "method": "GET",
+            "description": "Most recent listens",
+            "params": {
+                "limit": {"type": "int", "required": False, "default": 50, "max": 500},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/artist/{artist_name}",
+            "method": "GET",
+            "description": "Detailed stats for a specific artist: total listens, top tracks, yearly breakdown",
+            "params": {
+                "artist_name": {"type": "string", "required": True, "location": "path"},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/album-completion",
+            "method": "GET",
+            "description": "Lifetime tracklist coverage per album — how many tracks you've heard",
+            "params": {
+                "artist": {"type": "string", "required": False},
+                "start_date": {"type": "ISO date string", "required": False},
+                "end_date": {"type": "ISO date string", "required": False},
+                "days": {"type": "int", "required": False},
+                "min_completion": {"type": "float 0-1", "required": False},
+                "max_completion": {"type": "float 0-1", "required": False},
+                "limit": {"type": "int", "required": False, "default": 50, "max": 1000},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/album-sessions",
+            "method": "GET",
+            "description": "Detected full and partial album listening sessions",
+            "params": {
+                "artist": {"type": "string", "required": False},
+                "album": {"type": "string", "required": False},
+                "start_date": {"type": "ISO date string", "required": False},
+                "end_date": {"type": "ISO date string", "required": False},
+                "days": {"type": "int", "required": False},
+                "min_completion": {"type": "float 0-1", "required": False, "default": 0.0},
+                "session_type": {"type": "string", "required": False, "enum": ["full", "partial"]},
+                "gap_minutes": {"type": "int", "required": False, "default": 30},
+                "limit": {"type": "int", "required": False, "default": 50, "max": 1000},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/artists/batch",
+            "method": "POST",
+            "description": "Bulk artist lookup with album completion and session data",
+            "body": {"artists": ["list of artist names"]},
+            "auth": True,
+        },
+        {
+            "route": "/api/album-tracklist-resolver",
+            "method": "POST",
+            "description": "Trigger MusicBrainz resolution for albums missing tracklist data",
+            "body": {"artist": "optional string", "album": "optional string"},
+            "auth": True,
+        },
+        {
+            "route": "/api/album-tracklist-resolver",
+            "method": "GET",
+            "description": "Check album tracklist resolution status",
+            "params": {},
+            "auth": True,
+        },
+        {
+            "route": "/api/query",
+            "method": "POST",
+            "description": "Run an arbitrary read-only SQL query (uses read-only DB role)",
+            "body": {"sql": "SELECT ...", "limit": 100},
+            "auth": True,
+        },
+    ]
+}
