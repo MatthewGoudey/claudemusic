@@ -46,23 +46,23 @@ def _df(
     return parse_date_filter(start_date, end_date, days, limit)
 
 
-async def _get_album_track_count(artist: str, album: str) -> tuple[int, str]:
-    """Get track count from album_tracklist or fall back to heuristic.
+async def _get_album_track_info(artist: str, album: str) -> tuple[int, str, str]:
+    """Get track count, source, and release type from album_tracklist or heuristic.
 
-    Returns (track_count, source) where source is 'musicbrainz' or 'heuristic'.
+    Returns (track_count, tracklist_source, release_type).
     """
     row = await fetchrow(
-        "SELECT track_count FROM album_tracklist WHERE LOWER(raw_artist) = LOWER($1) AND LOWER(raw_album) = LOWER($2)",
+        "SELECT track_count, release_type FROM album_tracklist WHERE LOWER(raw_artist) = LOWER($1) AND LOWER(raw_album) = LOWER($2)",
         artist, album,
     )
     if row:
-        return row["track_count"], "musicbrainz"
+        return row["track_count"], "musicbrainz", row.get("release_type", "unknown")
 
     count = await fetchval(
         "SELECT COUNT(DISTINCT raw_title) FROM listen_events WHERE LOWER(raw_artist) = LOWER($1) AND LOWER(raw_album) = LOWER($2)",
         artist, album,
     )
-    return count or 0, "heuristic"
+    return count or 0, "heuristic", "unknown"
 
 
 # ============================================================
@@ -359,7 +359,7 @@ async def album_completion(
 
     results = []
     for album in albums:
-        total_tracks, source = await _get_album_track_count(album["raw_artist"], album["raw_album"])
+        total_tracks, source, _ = await _get_album_track_info(album["raw_artist"], album["raw_album"])
         if total_tracks == 0:
             continue
 
@@ -409,6 +409,7 @@ async def album_sessions(
     days: Optional[int] = None,
     min_completion: Optional[float] = Query(default=0.0),
     session_type: Optional[str] = Query(default=None, pattern="^(full|partial)$"),
+    release_type: Optional[str] = Query(default=None, pattern="^(Album|EP|Single)$"),
     limit: int = Query(default=50, le=1000),
     _=Depends(verify_key),
 ):
@@ -431,13 +432,18 @@ async def album_sessions(
         idx = len(params) + 1
         clauses.append(f"session_type = ${idx}")
         params.append(session_type)
+    if release_type:
+        idx = len(params) + 1
+        clauses.append(f"release_type = ${idx}")
+        params.append(release_type)
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     idx = len(params) + 1
 
     rows = await fetch(f"""
         SELECT raw_artist, raw_album, session_start, session_end,
-               tracks_played, total_tracks, completion, session_type, tracklist_source
+               tracks_played, total_tracks, completion, session_type,
+               release_type, tracklist_source
         FROM album_sessions
         {where}
         ORDER BY session_start DESC
@@ -452,6 +458,7 @@ async def album_sessions(
             "album": album,
             "min_completion": min_completion,
             "session_type": session_type,
+            "release_type": release_type,
         },
     }
 
@@ -466,6 +473,7 @@ async def album_sessions_stats(
     end_date: Optional[str] = None,
     days: Optional[int] = None,
     session_type: Optional[str] = Query(default=None, pattern="^(full|partial)$"),
+    release_type: Optional[str] = Query(default=None, pattern="^(Album|EP|Single)$"),
     _=Depends(verify_key),
 ):
     df = _df(start_date, end_date, days, limit=50)
@@ -475,6 +483,10 @@ async def album_sessions_stats(
         idx = len(params) + 1
         clauses.append(f"session_type = ${idx}")
         params.append(session_type)
+    if release_type:
+        idx = len(params) + 1
+        clauses.append(f"release_type = ${idx}")
+        params.append(release_type)
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
@@ -518,6 +530,7 @@ async def album_sessions_stats(
         "filters": {
             **df.as_dict(),
             "session_type": session_type,
+            "release_type": release_type,
         },
     }
 
@@ -582,7 +595,7 @@ async def artists_batch(body: ArtistBatchRequest, _=Depends(verify_key)):
 
         album_results = []
         for alb in albums:
-            total_tracks, _ = await _get_album_track_count(artist_name, alb["raw_album"])
+            total_tracks, _, rel_type = await _get_album_track_info(artist_name, alb["raw_album"])
             completion = round(alb["tracks_heard"] / total_tracks, 2) if total_tracks > 0 else 0.0
 
             sc = session_map.get(alb["raw_album"], {})
@@ -593,6 +606,7 @@ async def artists_batch(body: ArtistBatchRequest, _=Depends(verify_key)):
                 "total_tracks": total_tracks,
                 "completion": completion,
                 "listen_count": alb["listen_count"],
+                "release_type": rel_type,
                 "full_sessions": sc.get("full_sessions", 0),
                 "partial_sessions": sc.get("partial_sessions", 0),
             })

@@ -31,15 +31,11 @@ async def resolve_album_tracklist(
     client: httpx.AsyncClient,
     artist: str,
     album: str,
-) -> int | None:
-    """Query MusicBrainz for an album's track count.
+) -> tuple[int, str] | None:
+    """Query MusicBrainz for an album's track count and release type.
 
-    Searches the release endpoint (which supports release:/artist: fields),
-    filters to releases whose release-group has primary-type=Album,
-    excludes deluxe/expanded editions and releases with < 5 tracks,
-    and returns the median track count.
-
-    Single API call — track counts come from the release search results directly.
+    Searches the release endpoint, groups results by release-group primary-type,
+    prefers Album > EP > Single. Returns (track_count, release_type) or None.
     """
     query = f'"{album}" AND artist:"{artist}"'
     params = {"query": query, "fmt": "json", "limit": "25"}
@@ -60,39 +56,43 @@ async def resolve_album_tracklist(
     if not releases:
         return None
 
-    # Filter to releases whose release-group is primary-type "Album"
-    # Then collect track counts, excluding deluxe editions and < 5 tracks
-    track_counts = []
+    # Group track counts by release type, preferring Album > EP > Single
+    by_type: dict[str, list[int]] = {}
+    by_type_unfiltered: dict[str, list[int]] = {}
+
     for release in releases:
         rg = release.get("release-group", {})
         primary_type = rg.get("primary-type", "")
-        if primary_type != "Album":
-            continue
-
-        title = release.get("title", "")
-        if EDITION_EXCLUDE.search(title):
+        if not primary_type:
             continue
 
         media = release.get("media", [])
         total = sum(m.get("track-count", 0) for m in media)
-        if total >= 5:
-            track_counts.append(total)
+        if total <= 0:
+            continue
 
-    # Fallback: if all Album releases were excluded by edition filter, retry without it
-    if not track_counts:
-        for release in releases:
-            rg = release.get("release-group", {})
-            if rg.get("primary-type", "") != "Album":
-                continue
-            media = release.get("media", [])
-            total = sum(m.get("track-count", 0) for m in media)
-            if total >= 5:
-                track_counts.append(total)
+        title = release.get("title", "")
+        by_type_unfiltered.setdefault(primary_type, []).append(total)
 
-    if not track_counts:
-        return None
+        if EDITION_EXCLUDE.search(title):
+            continue
+        by_type.setdefault(primary_type, []).append(total)
 
-    return int(statistics.median(track_counts))
+    # Pick best type in preference order
+    for release_type in ("Album", "EP", "Single"):
+        counts = by_type.get(release_type, [])
+        if release_type == "Album":
+            counts = [c for c in counts if c >= 5]
+        if counts:
+            return int(statistics.median(counts)), release_type
+
+        counts = by_type_unfiltered.get(release_type, [])
+        if release_type == "Album":
+            counts = [c for c in counts if c >= 5]
+        if counts:
+            return int(statistics.median(counts)), release_type
+
+    return None
 
 
 async def resolve_single(artist: str, album: str) -> dict:
@@ -101,25 +101,31 @@ async def resolve_single(artist: str, album: str) -> dict:
         headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
         timeout=30,
     ) as client:
-        track_count = await resolve_album_tracklist(client, artist, album)
+        result = await resolve_album_tracklist(client, artist, album)
 
-    if track_count is not None:
+    if result is not None:
+        track_count, release_type = result
         await execute(
-            """INSERT INTO album_tracklist (raw_artist, raw_album, track_count, source, resolved_at)
-               VALUES ($1, $2, $3, 'musicbrainz', $4)
+            """INSERT INTO album_tracklist (raw_artist, raw_album, track_count, release_type, source, resolved_at)
+               VALUES ($1, $2, $3, $4, 'musicbrainz', $5)
                ON CONFLICT (raw_artist, raw_album)
-               DO UPDATE SET track_count = $3, resolved_at = $4""",
-            artist, album, track_count, datetime.now(timezone.utc),
+               DO UPDATE SET track_count = $3, release_type = $4, resolved_at = $5""",
+            artist, album, track_count, release_type, datetime.now(timezone.utc),
         )
-        return {"raw_artist": artist, "raw_album": album, "track_count": track_count, "status": "resolved"}
+        # Invalidate precomputed sessions
+        await execute(
+            "DELETE FROM album_sessions WHERE LOWER(raw_artist) = LOWER($1) AND LOWER(raw_album) = LOWER($2)",
+            artist, album,
+        )
+        return {"raw_artist": artist, "raw_album": album, "track_count": track_count, "release_type": release_type, "status": "resolved"}
     else:
         return {"raw_artist": artist, "raw_album": album, "error": "No match found", "status": "failed"}
 
 
 async def resolve_all_missing() -> dict:
     """Resolve all albums in listen_events that aren't in album_tracklist."""
-    # Clean up bad matches from previous runs (singles/EPs that slipped through)
-    await execute("DELETE FROM album_tracklist WHERE track_count < 5")
+    # Re-resolve entries missing release_type
+    await execute("DELETE FROM album_tracklist WHERE release_type = 'unknown'")
 
     # Find unresolved albums
     unresolved = await fetch("""
@@ -147,18 +153,23 @@ async def resolve_all_missing() -> dict:
             album = row["raw_album"]
 
             await asyncio.sleep(1.1)  # Rate limit
-            track_count = await resolve_album_tracklist(client, artist, album)
+            result = await resolve_album_tracklist(client, artist, album)
 
-            if track_count is not None:
+            if result is not None:
+                track_count, release_type = result
                 await execute(
-                    """INSERT INTO album_tracklist (raw_artist, raw_album, track_count, source, resolved_at)
-                       VALUES ($1, $2, $3, 'musicbrainz', $4)
+                    """INSERT INTO album_tracklist (raw_artist, raw_album, track_count, release_type, source, resolved_at)
+                       VALUES ($1, $2, $3, $4, 'musicbrainz', $5)
                        ON CONFLICT (raw_artist, raw_album)
-                       DO UPDATE SET track_count = $3, resolved_at = $4""",
-                    artist, album, track_count, datetime.now(timezone.utc),
+                       DO UPDATE SET track_count = $3, release_type = $4, resolved_at = $5""",
+                    artist, album, track_count, release_type, datetime.now(timezone.utc),
+                )
+                await execute(
+                    "DELETE FROM album_sessions WHERE LOWER(raw_artist) = LOWER($1) AND LOWER(raw_album) = LOWER($2)",
+                    artist, album,
                 )
                 resolved += 1
-                logger.info(f"Resolved: {artist} - {album} ({track_count} tracks)")
+                logger.info(f"Resolved: {artist} - {album} ({track_count} tracks, {release_type})")
             else:
                 failed += 1
                 failures.append({"raw_artist": artist, "raw_album": album, "error": "No match found"})
@@ -168,7 +179,7 @@ async def resolve_all_missing() -> dict:
         "resolved": resolved,
         "failed": failed,
         "already_cached": already_cached,
-        "failures": failures[:50],  # Cap failure list
+        "failures": failures[:50],
     }
 
 
