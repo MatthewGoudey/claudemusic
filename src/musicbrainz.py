@@ -34,75 +34,56 @@ async def resolve_album_tracklist(
 ) -> int | None:
     """Query MusicBrainz for an album's track count.
 
-    Filters to primary-type=Album release groups only (excludes singles, EPs,
-    compilations). Applies a minimum track count floor of 5 and uses the median
-    track count across standard releases.
+    Searches the release endpoint (which supports release:/artist: fields),
+    filters to releases whose release-group has primary-type=Album,
+    excludes deluxe/expanded editions and releases with < 5 tracks,
+    and returns the median track count.
+
+    Single API call — track counts come from the release search results directly.
     """
-    query = f'release:{album} AND artist:{artist}'
-    params = {"query": query, "fmt": "json", "limit": "10"}
+    query = f'"{album}" AND artist:"{artist}"'
+    params = {"query": query, "fmt": "json", "limit": "25"}
 
     try:
-        resp = await client.get(f"{MB_BASE}/release-group", params=params)
+        resp = await client.get(f"{MB_BASE}/release", params=params)
         if resp.status_code == 503:
             logger.warning("Rate limited by MB, backing off 5s")
             await asyncio.sleep(5)
-            resp = await client.get(f"{MB_BASE}/release-group", params=params)
+            resp = await client.get(f"{MB_BASE}/release", params=params)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
         logger.error(f"MB API error for '{artist}' - '{album}': {e}")
         return None
 
-    release_groups = data.get("release-groups", [])
-    if not release_groups:
-        return None
-
-    # Find the first release group with primary-type "Album"
-    rg = None
-    for candidate in release_groups:
-        primary_type = candidate.get("primary-type", "")
-        if primary_type == "Album":
-            rg = candidate
-            break
-
-    # If no Album type found, skip — don't match singles/EPs/compilations
-    if rg is None:
-        return None
-
-    rg_id = rg.get("id")
-    if not rg_id:
-        return None
-
-    await asyncio.sleep(1.1)  # Rate limit
-    try:
-        resp = await client.get(
-            f"{MB_BASE}/release",
-            params={"release-group": rg_id, "fmt": "json", "limit": "50", "inc": "media"},
-        )
-        resp.raise_for_status()
-        releases_data = resp.json()
-    except Exception as e:
-        logger.error(f"MB API error fetching releases for rg {rg_id}: {e}")
-        return None
-
-    releases = releases_data.get("releases", [])
+    releases = data.get("releases", [])
     if not releases:
         return None
 
-    # Collect track counts, excluding deluxe editions and releases with < 5 tracks
+    # Filter to releases whose release-group is primary-type "Album"
+    # Then collect track counts, excluding deluxe editions and < 5 tracks
     track_counts = []
     for release in releases:
+        rg = release.get("release-group", {})
+        primary_type = rg.get("primary-type", "")
+        if primary_type != "Album":
+            continue
+
         title = release.get("title", "")
         if EDITION_EXCLUDE.search(title):
             continue
+
         media = release.get("media", [])
         total = sum(m.get("track-count", 0) for m in media)
         if total >= 5:
             track_counts.append(total)
 
-    # Fallback: if all were excluded by edition filter, try unfiltered (still with floor)
+    # Fallback: if all Album releases were excluded by edition filter, retry without it
     if not track_counts:
         for release in releases:
+            rg = release.get("release-group", {})
+            if rg.get("primary-type", "") != "Album":
+                continue
             media = release.get("media", [])
             total = sum(m.get("track-count", 0) for m in media)
             if total >= 5:
