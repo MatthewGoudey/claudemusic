@@ -786,15 +786,27 @@ async def chicago_shows(
         SELECT DISTINCT cs.show_id, cs.artist_name, cs.venue_name, cs.show_date, cs.show_time,
                cs.doors_time, cs.support_acts, cs.ticket_url, cs.ticket_price, cs.age_restriction,
                cs.sources, cs.presale_name, cs.presale_start, cs.presale_end, cs.onsale_date,
-               cs.festival_name, cs.status, cs.first_seen, cs.last_verified
+               cs.festival_name, cs.status, cs.first_seen, cs.last_verified,
+               v.travel_driving_min, v.travel_transit_min, v.travel_best_min
         FROM chicago_shows cs
+        LEFT JOIN venues v ON LOWER(v.venue_name) = LOWER(cs.venue_name)
         {genre_join}
         {where}
         ORDER BY cs.show_date ASC, cs.show_time ASC NULLS LAST
         LIMIT ${idx}
     """, *params, df.limit)
 
-    return {"shows": rows, "count": len(rows), "filters": {**df.as_dict(), "venue": venue, "artist": artist, "genre": genre, "festival": festival, "status": status}}
+    shows = []
+    for row in rows:
+        show = dict(row)
+        show["travel"] = {
+            "driving_min": show.pop("travel_driving_min", None),
+            "transit_min": show.pop("travel_transit_min", None),
+            "best_min": show.pop("travel_best_min", None),
+        }
+        shows.append(show)
+
+    return {"shows": shows, "count": len(shows), "filters": {**df.as_dict(), "venue": venue, "artist": artist, "genre": genre, "festival": festival, "status": status}}
 
 
 @app.get("/api/chicago-shows/presales")
@@ -804,19 +816,31 @@ async def chicago_presales(
     _=Depends(verify_key),
 ):
     rows = await fetch("""
-        SELECT show_id, artist_name, venue_name, show_date, show_time,
-               ticket_url, ticket_price, presale_name, presale_start, presale_end,
-               onsale_date, sources, festival_name, first_seen
-        FROM chicago_shows
-        WHERE presale_start IS NOT NULL
-          AND presale_start > NOW() - INTERVAL '1 day'
-          AND presale_start < NOW() + MAKE_INTERVAL(days => $1)
-          AND status = 'upcoming'
-        ORDER BY presale_start ASC
+        SELECT cs.show_id, cs.artist_name, cs.venue_name, cs.show_date, cs.show_time,
+               cs.ticket_url, cs.ticket_price, cs.presale_name, cs.presale_start, cs.presale_end,
+               cs.onsale_date, cs.sources, cs.festival_name, cs.first_seen,
+               v.travel_driving_min, v.travel_transit_min, v.travel_best_min
+        FROM chicago_shows cs
+        LEFT JOIN venues v ON LOWER(v.venue_name) = LOWER(cs.venue_name)
+        WHERE cs.presale_start IS NOT NULL
+          AND cs.presale_start > NOW() - INTERVAL '1 day'
+          AND cs.presale_start < NOW() + MAKE_INTERVAL(days => $1)
+          AND cs.status = 'upcoming'
+        ORDER BY cs.presale_start ASC
         LIMIT $2
     """, days, limit)
 
-    return {"presales": rows, "count": len(rows), "filters": {"days": days}}
+    presales = []
+    for row in rows:
+        show = dict(row)
+        show["travel"] = {
+            "driving_min": show.pop("travel_driving_min", None),
+            "transit_min": show.pop("travel_transit_min", None),
+            "best_min": show.pop("travel_best_min", None),
+        }
+        presales.append(show)
+
+    return {"presales": presales, "count": len(presales), "filters": {"days": days}}
 
 
 @app.get("/api/chicago-shows/just-announced")
@@ -826,16 +850,28 @@ async def chicago_just_announced(
     _=Depends(verify_key),
 ):
     rows = await fetch("""
-        SELECT show_id, artist_name, venue_name, show_date, show_time,
-               ticket_url, ticket_price, sources, festival_name, first_seen, status
-        FROM chicago_shows
-        WHERE first_seen > NOW() - MAKE_INTERVAL(days => $1)
-          AND show_date >= CURRENT_DATE
-        ORDER BY first_seen DESC
+        SELECT cs.show_id, cs.artist_name, cs.venue_name, cs.show_date, cs.show_time,
+               cs.ticket_url, cs.ticket_price, cs.sources, cs.festival_name, cs.first_seen, cs.status,
+               v.travel_driving_min, v.travel_transit_min, v.travel_best_min
+        FROM chicago_shows cs
+        LEFT JOIN venues v ON LOWER(v.venue_name) = LOWER(cs.venue_name)
+        WHERE cs.first_seen > NOW() - MAKE_INTERVAL(days => $1)
+          AND cs.show_date >= CURRENT_DATE
+        ORDER BY cs.first_seen DESC
         LIMIT $2
     """, days, limit)
 
-    return {"shows": rows, "count": len(rows), "filters": {"days": days}}
+    shows = []
+    for row in rows:
+        show = dict(row)
+        show["travel"] = {
+            "driving_min": show.pop("travel_driving_min", None),
+            "transit_min": show.pop("travel_transit_min", None),
+            "best_min": show.pop("travel_best_min", None),
+        }
+        shows.append(show)
+
+    return {"shows": shows, "count": len(shows), "filters": {"days": days}}
 
 
 @app.get("/api/chicago-shows/match")
