@@ -728,49 +728,58 @@ async def chicago_shows(
     days: Optional[int] = None,
     venue: Optional[str] = None,
     artist: Optional[str] = None,
+    genre: Optional[str] = None,
     status: Optional[str] = Query(default="upcoming", pattern="^(upcoming|sold_out|cancelled|past|all)$"),
     limit: int = Query(default=50, le=1000),
     _=Depends(verify_key),
 ):
     df = _df(start_date, end_date, days, limit)
-    clauses, params = df.build_where(col="show_date")
+    clauses, params = df.build_where(col="cs.show_date")
 
     # Default to today onward if no date filter specified
     if not df.effective_start and not df.effective_end:
         idx = len(params) + 1
-        clauses.append(f"show_date >= ${idx}")
+        clauses.append(f"cs.show_date >= ${idx}")
         params.append(date.today())
 
     if status and status != "all":
         idx = len(params) + 1
-        clauses.append(f"status = ${idx}")
+        clauses.append(f"cs.status = ${idx}")
         params.append(status)
 
     if venue:
         idx = len(params) + 1
-        clauses.append(f"LOWER(venue_name) %% LOWER(${idx})")
+        clauses.append(f"LOWER(cs.venue_name) %% LOWER(${idx})")
         params.append(venue)
 
     if artist:
         idx = len(params) + 1
-        clauses.append(f"LOWER(artist_name) %% LOWER(${idx})")
+        clauses.append(f"LOWER(cs.artist_name) %% LOWER(${idx})")
         params.append(artist)
+
+    genre_join = ""
+    if genre:
+        idx = len(params) + 1
+        genre_join = "JOIN artist_tags at ON at.norm_artist = normalize_artist(cs.artist_name)"
+        clauses.append(f"LOWER(at.tag) LIKE LOWER(${idx})")
+        params.append(f"%{genre}%")
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     idx = len(params) + 1
 
     rows = await fetch(f"""
-        SELECT show_id, artist_name, venue_name, show_date, show_time, doors_time,
-               support_acts, ticket_url, ticket_price, age_restriction,
-               sources, presale_name, presale_start, presale_end, onsale_date,
-               status, first_seen, last_verified
-        FROM chicago_shows
+        SELECT DISTINCT cs.show_id, cs.artist_name, cs.venue_name, cs.show_date, cs.show_time,
+               cs.doors_time, cs.support_acts, cs.ticket_url, cs.ticket_price, cs.age_restriction,
+               cs.sources, cs.presale_name, cs.presale_start, cs.presale_end, cs.onsale_date,
+               cs.status, cs.first_seen, cs.last_verified
+        FROM chicago_shows cs
+        {genre_join}
         {where}
-        ORDER BY show_date ASC, show_time ASC NULLS LAST
+        ORDER BY cs.show_date ASC, cs.show_time ASC NULLS LAST
         LIMIT ${idx}
     """, *params, df.limit)
 
-    return {"shows": rows, "count": len(rows), "filters": {**df.as_dict(), "venue": venue, "artist": artist, "status": status}}
+    return {"shows": rows, "count": len(rows), "filters": {**df.as_dict(), "venue": venue, "artist": artist, "genre": genre, "status": status}}
 
 
 @app.get("/api/chicago-shows/presales")
@@ -820,6 +829,7 @@ async def chicago_match(
     end_date: Optional[str] = None,
     days: Optional[int] = None,
     min_listens: int = Query(default=1),
+    genre: Optional[str] = None,
     limit: int = Query(default=50, le=1000),
     _=Depends(verify_key),
 ):
@@ -843,6 +853,11 @@ async def chicago_match(
 
     clauses.append("cs.status = 'upcoming'")
 
+    genre_join = ""
+    if genre:
+        params.append(f"%{genre}%")
+        genre_join = f"JOIN artist_tags gt ON gt.norm_artist = normalize_artist(cs.artist_name) AND LOWER(gt.tag) LIKE LOWER(${len(params)})"
+
     params.append(min_listens)
     min_idx = len(params)
 
@@ -854,12 +869,13 @@ async def chicago_match(
     # Single query: normalize only the ~3K show rows, then PK join to precomputed stats
     rows = await fetch(f"""
         WITH upcoming AS (
-            SELECT cs.show_id, cs.artist_name, cs.venue_name, cs.show_date, cs.show_time,
+            SELECT DISTINCT cs.show_id, cs.artist_name, cs.venue_name, cs.show_date, cs.show_time,
                    cs.doors_time, cs.support_acts, cs.ticket_url, cs.ticket_price,
                    cs.age_restriction, cs.sources, cs.presale_name, cs.presale_start,
                    cs.presale_end, cs.onsale_date, cs.status, cs.first_seen, cs.last_verified,
                    normalize_artist(cs.artist_name) AS norm_artist
             FROM chicago_shows cs
+            {genre_join}
             {where}
         )
         SELECT u.*,
@@ -917,7 +933,7 @@ async def chicago_match(
     return {
         "matches": matches,
         "unmatched_count": (total_upcoming or 0) - len(matches),
-        "filters": {**df.as_dict(), "min_listens": min_listens},
+        "filters": {**df.as_dict(), "min_listens": min_listens, "genre": genre},
     }
 
 
@@ -931,6 +947,7 @@ async def discover(
     include_events: bool = Query(default=True),
     max_similar: int = Query(default=20, le=100),
     exclude_heard: bool = Query(default=False),
+    genre: Optional[str] = None,
     _=Depends(verify_key),
 ):
     pool = await get_pool()
@@ -1006,6 +1023,15 @@ async def discover(
             for artist in similar_artists:
                 artist["tags"] = tag_map.get(artist["norm_artist"], [])
 
+            # Filter by genre if specified
+            if genre:
+                genre_lower = genre.lower()
+                similar_artists = [
+                    a for a in similar_artists
+                    if any(genre_lower in t for t in a["tags"])
+                ]
+                similar_norms = [a["norm_artist"] for a in similar_artists]
+
         # Fetch upcoming shows for similar artists + seed
         if include_events and similar_norms:
             all_norms = [norm_seed] + similar_norms
@@ -1059,6 +1085,7 @@ async def discover(
             "max_similar": max_similar,
             "exclude_heard": exclude_heard,
             "include_events": include_events,
+            "genre": genre,
         },
     }
 
