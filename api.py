@@ -48,6 +48,21 @@ async def startup():
                 ))
             $$ LANGUAGE SQL IMMUTABLE
         """)
+        # Ensure artist_listen_stats table exists
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS artist_listen_stats (
+                norm_artist   TEXT PRIMARY KEY,
+                raw_artist    TEXT NOT NULL,
+                total_listens INTEGER NOT NULL,
+                unique_tracks INTEGER NOT NULL,
+                unique_albums INTEGER NOT NULL,
+                last_listen   TIMESTAMPTZ,
+                listens_90d   INTEGER NOT NULL DEFAULT 0,
+                listens_365d  INTEGER NOT NULL DEFAULT 0,
+                top_album     TEXT,
+                computed_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
 
 
 @app.on_event("shutdown")
@@ -811,130 +826,96 @@ async def chicago_match(
     df = _df(start_date, end_date, days, limit)
 
     # Build show date filter
-    show_clauses, show_params = [], []
+    params = []
+    clauses = []
+
     if df.effective_start:
-        show_clauses.append(f"cs.show_date >= ${len(show_params) + 1}")
-        show_params.append(df.effective_start.date() if hasattr(df.effective_start, 'date') else df.effective_start)
+        params.append(df.effective_start.date() if hasattr(df.effective_start, 'date') else df.effective_start)
     else:
-        show_clauses.append(f"cs.show_date >= ${len(show_params) + 1}")
-        show_params.append(date.today())
+        params.append(date.today())
+    clauses.append(f"cs.show_date >= ${len(params)}")
 
     if df.effective_end:
-        show_clauses.append(f"cs.show_date <= ${len(show_params) + 1}")
-        show_params.append(df.effective_end.date() if hasattr(df.effective_end, 'date') else df.effective_end)
+        params.append(df.effective_end.date() if hasattr(df.effective_end, 'date') else df.effective_end)
     else:
-        show_clauses.append(f"cs.show_date <= ${len(show_params) + 1}")
-        show_params.append(date.today() + timedelta(days=90))
+        params.append(date.today() + timedelta(days=90))
+    clauses.append(f"cs.show_date <= ${len(params)}")
 
-    show_clauses.append("cs.status = 'upcoming'")
-    where = "WHERE " + " AND ".join(show_clauses)
+    clauses.append("cs.status = 'upcoming'")
 
-    # Get all upcoming shows with normalized artist names
-    shows = await fetch(f"""
-        SELECT cs.*, normalize_artist(cs.artist_name) AS norm_artist
-        FROM chicago_shows cs
-        {where}
-        ORDER BY cs.show_date ASC
-    """, *show_params)
+    params.append(min_listens)
+    min_idx = len(params)
 
-    if not shows:
-        return {"matches": [], "unmatched_count": 0, "filters": df.as_dict()}
+    params.append(df.limit)
+    limit_idx = len(params)
 
-    # Get distinct normalized artist names from shows
-    norm_artists = list({s["norm_artist"] for s in shows if s["norm_artist"] and s["norm_artist"].strip()})
+    where = "WHERE " + " AND ".join(clauses)
 
-    if not norm_artists:
-        return {"matches": [], "unmatched_count": len(shows), "filters": df.as_dict()}
-
-    # Single query: join shows against listen_events using normalize_artist,
-    # compute stats + top album in one pass using LATERAL + window functions
-    listening_stats = await fetch("""
-        WITH show_artists AS (
-            SELECT DISTINCT norm_artist
-            FROM unnest($1::text[]) AS norm_artist
-            WHERE norm_artist IS NOT NULL AND norm_artist != ''
-        ),
-        artist_stats AS (
-            SELECT
-                sa.norm_artist,
-                le.raw_artist AS known_as,
-                COUNT(*) AS total_listens,
-                COUNT(DISTINCT le.raw_title) AS unique_tracks,
-                COUNT(DISTINCT le.raw_album) FILTER (WHERE le.raw_album IS NOT NULL) AS unique_albums,
-                MAX(le.listened_at) AS last_listen,
-                COUNT(*) FILTER (WHERE le.listened_at > NOW() - INTERVAL '90 days') AS listens_90d,
-                COUNT(*) FILTER (WHERE le.listened_at > NOW() - INTERVAL '365 days') AS listens_365d
-            FROM show_artists sa
-            JOIN listen_events le ON LOWER(le.raw_artist) = sa.norm_artist
-                OR normalize_artist(le.raw_artist) = sa.norm_artist
-            GROUP BY sa.norm_artist, le.raw_artist
-        ),
-        best_per_artist AS (
-            SELECT DISTINCT ON (norm_artist) *
-            FROM artist_stats
-            ORDER BY norm_artist, total_listens DESC
-        ),
-        top_albums AS (
-            SELECT DISTINCT ON (bpa.norm_artist)
-                bpa.norm_artist,
-                le.raw_album
-            FROM best_per_artist bpa
-            JOIN listen_events le ON LOWER(le.raw_artist) = LOWER(bpa.known_as)
-            WHERE le.raw_album IS NOT NULL
-            GROUP BY bpa.norm_artist, le.raw_album
-            ORDER BY bpa.norm_artist, COUNT(*) DESC
+    # Single query: normalize only the ~3K show rows, then PK join to precomputed stats
+    rows = await fetch(f"""
+        WITH upcoming AS (
+            SELECT cs.show_id, cs.artist_name, cs.venue_name, cs.show_date, cs.show_time,
+                   cs.doors_time, cs.support_acts, cs.ticket_url, cs.ticket_price,
+                   cs.age_restriction, cs.sources, cs.presale_name, cs.presale_start,
+                   cs.presale_end, cs.onsale_date, cs.status, cs.first_seen, cs.last_verified,
+                   normalize_artist(cs.artist_name) AS norm_artist
+            FROM chicago_shows cs
+            {where}
         )
-        SELECT bpa.*, ta.raw_album AS top_album
-        FROM best_per_artist bpa
-        LEFT JOIN top_albums ta ON ta.norm_artist = bpa.norm_artist
-    """, norm_artists)
+        SELECT u.*,
+               als.total_listens, als.unique_tracks, als.unique_albums,
+               als.last_listen, als.listens_90d, als.listens_365d, als.top_album
+        FROM upcoming u
+        JOIN artist_listen_stats als ON als.norm_artist = u.norm_artist
+            AND als.norm_artist != ''
+        WHERE als.total_listens >= ${min_idx}
+        ORDER BY
+            LN(als.total_listens + 1)
+            * LEAST(als.unique_tracks / 5.0, 3.0)
+            * CASE
+                WHEN als.listens_90d > 0 THEN 3.0
+                WHEN als.listens_365d > 0 THEN 2.0
+                ELSE 1.0
+              END
+            DESC
+        LIMIT ${limit_idx}
+    """, *params)
 
-    # Build lookup: norm_artist -> stats
-    stats_map: dict[str, dict] = {}
-    for row in listening_stats:
-        stats_map[row["norm_artist"]] = row
-
-    # Score and rank matches
+    # Format response
     matches = []
-    unmatched = 0
-
-    for show in shows:
-        na = show["norm_artist"]
-        stats = stats_map.get(na)
-        if not stats or stats["total_listens"] < min_listens:
-            unmatched += 1
-            continue
-
-        # Relevance score: log(listens) * track breadth * recency boost
-        total = stats["total_listens"]
-        tracks = stats["unique_tracks"]
-        track_factor = min(tracks / 5.0, 3.0)  # caps at 15 unique tracks
-        recency = 1.0
-        if stats["listens_90d"] > 0:
-            recency = 3.0
-        elif stats["listens_365d"] > 0:
-            recency = 2.0
+    for row in rows:
+        total = row["total_listens"]
+        tracks = row["unique_tracks"]
+        track_factor = min(tracks / 5.0, 3.0)
+        recency = 3.0 if row["listens_90d"] > 0 else (2.0 if row["listens_365d"] > 0 else 1.0)
         score = round(math.log(total + 1) * track_factor * recency, 1)
 
-        show_out = {k: v for k, v in show.items() if k != "norm_artist"}
-
         matches.append({
-            "show": show_out,
+            "show": {
+                k: row[k] for k in [
+                    "show_id", "artist_name", "venue_name", "show_date", "show_time",
+                    "doors_time", "support_acts", "ticket_url", "ticket_price",
+                    "age_restriction", "sources", "presale_name", "presale_start",
+                    "presale_end", "onsale_date", "status", "first_seen", "last_verified",
+                ]
+            },
             "listening_stats": {
-                "total_listens": stats["total_listens"],
-                "unique_tracks": stats["unique_tracks"],
-                "unique_albums": stats["unique_albums"],
-                "last_listen": stats["last_listen"].isoformat() if stats["last_listen"] else None,
-                "top_album": stats.get("top_album"),
+                "total_listens": row["total_listens"],
+                "unique_tracks": row["unique_tracks"],
+                "unique_albums": row["unique_albums"],
+                "last_listen": row["last_listen"].isoformat() if row["last_listen"] else None,
+                "top_album": row["top_album"],
             },
             "relevance_score": score,
         })
 
-    matches.sort(key=lambda m: m["relevance_score"], reverse=True)
-    matches = matches[:df.limit]
+    # Unmatched count
+    total_upcoming = await fetchval(f"""
+        SELECT COUNT(*) FROM chicago_shows cs {where}
+    """, *params[:len(clauses)])
 
     return {
         "matches": matches,
-        "unmatched_count": unmatched,
+        "unmatched_count": (total_upcoming or 0) - len(matches),
         "filters": {**df.as_dict(), "min_listens": min_listens},
     }
