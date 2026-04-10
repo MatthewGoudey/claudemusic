@@ -48,7 +48,7 @@ Output:
     },
     "gap": {
         "name": "Gap Fill",
-        "description": "Address known canonical gaps — foundational albums the user knows they're missing.",
+        "description": "Known canonical gaps from genre audits. Start with jumping-off album.",
         "spec": """\
 Mode: gap_fill
 
@@ -77,7 +77,7 @@ Output:
     },
     "roots": {
         "name": "Root Tracing",
-        "description": "Go backward from a genre the user loves to its foundational layer.",
+        "description": "Trace backward from modern favorites to genre foundations.",
         "spec": """\
 Mode: root_tracing
 
@@ -99,7 +99,7 @@ Output:
     },
     "scene": {
         "name": "Scene Exploration",
-        "description": "Lock onto a specific city/label/era ecosystem and explore it as a network.",
+        "description": "Explore a city/label/era ecosystem as a network.",
         "spec": """\
 Mode: scene_exploration
 
@@ -125,7 +125,7 @@ Scene overview (3-5 sentences of infrastructure context) plus 1 entry-point rele
     },
     "bridge": {
         "name": "Bridge Building",
-        "description": "Find artists at the intersection of two genres the user is already into.",
+        "description": "Artists at the intersection of two genres you're into.",
         "spec": """\
 Mode: bridge_building
 
@@ -154,7 +154,7 @@ Output:
     },
     "adjacent": {
         "name": "Adjacent Genre",
-        "description": "Identify unexplored genres that border genres the user is deep in.",
+        "description": "Entry point to an unexplored genre bordering your strong ones.",
         "spec": """\
 Mode: adjacent_genre
 
@@ -183,7 +183,7 @@ Genre name, why it's adjacent to user's taste, consensus entry-point album, 1 co
     },
     "mood": {
         "name": "Mood / Sonic",
-        "description": "Cross-genre recommendations based on texture, energy, and emotional register.",
+        "description": "Cross-genre recs by texture/energy/emotion, not genre taxonomy.",
         "spec": """\
 Mode: mood_sonic
 
@@ -208,7 +208,7 @@ Output:
     },
     "cold": {
         "name": "Cold Discovery",
-        "description": "Zero existing listens on the recommended artist. Maximum distance from the comfort zone.",
+        "description": "Zero listens on the artist. Maximum distance, taste-rooted rationale.",
         "spec": """\
 Mode: cold_discovery
 
@@ -235,7 +235,7 @@ Output:
     },
     "revisit": {
         "name": "Revisit",
-        "description": "Albums listened to heavily in the past but not played in 6+ months.",
+        "description": "Albums loved then abandoned 6+ months ago.",
         "spec": """\
 Mode: revisit
 
@@ -259,7 +259,7 @@ Output:
     },
     "live": {
         "name": "Live Shows",
-        "description": "Find upcoming Chicago shows based on listening history, track presales, manage interest.",
+        "description": "Chicago shows matched against listening history + discovery.",
         "spec": """\
 Mode: live_shows
 
@@ -299,7 +299,7 @@ After presenting matches, offer discovery exploration via /api/discover.""",
     },
     "festival": {
         "name": "Festival Scout",
-        "description": "Analyze Chicago festival lineups against listening history, build a prep plan.",
+        "description": "Festival lineup analysis, prep plans, undercard discovery.",
         "spec": """\
 Mode: festival_scout
 

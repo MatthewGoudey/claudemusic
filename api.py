@@ -20,6 +20,11 @@ from src.filters import parse_date_filter, DateFilter
 from src.musicbrainz import resolve_single, resolve_all_missing, get_resolution_status
 from src.schema_registry import SCHEMA
 from src.modes import MODES
+from src.formatters import (
+    compact_top_artists, compact_top_tracks, compact_top_albums,
+    compact_recent, compact_album_completion, compact_chicago_shows_match,
+    compact_discover, compact_chicago_shows, _fmt_ts,
+)
 import math
 
 logger = logging.getLogger(__name__)
@@ -158,6 +163,174 @@ async def mode_detail(mode_id: str):
 
 
 # ============================================================
+# Session start (combined startup endpoint)
+# ============================================================
+
+def _suggest_mode(recent_rows, top_recent, top_alltime):
+    """Analyze listening patterns and suggest an exploration mode.
+
+    Returns (mode_id, reason).
+    """
+    if not recent_rows:
+        return "finish", "No recent listening data — finish mode always has candidates."
+
+    # Count plays per artist in recent data
+    artist_plays = {}
+    for r in recent_rows:
+        a = r.get("raw_artist", "")
+        artist_plays[a] = artist_plays.get(a, 0) + 1
+    total_recent = sum(artist_plays.values())
+
+    if total_recent == 0:
+        return "finish", "No recent listening data."
+
+    # Rule 3: One artist dominates (>30% of recent plays)
+    top_artist = max(artist_plays, key=artist_plays.get)
+    top_pct = artist_plays[top_artist] / total_recent
+    if top_pct > 0.30:
+        return "disco", f"{top_artist} is {round(top_pct * 100)}% of recent plays — explore their deeper catalog."
+
+    # Rule 2: Very scattered (no artist > 10% of recent)
+    max_pct = max(v / total_recent for v in artist_plays.values())
+    if max_pct < 0.10 and len(artist_plays) > 8:
+        return "finish", "Scattered listening across many artists — good time to complete something unfinished."
+
+    # Rule 5: New discovery — artist in recent top 10 not in alltime top 10
+    alltime_names = {r.get("raw_artist", "").lower() for r in (top_alltime or [])[:10]}
+    recent_top = sorted(artist_plays.items(), key=lambda x: -x[1])[:10]
+    for name, _ in recent_top:
+        if name.lower() not in alltime_names and name:
+            return "roots", f"You're exploring {name} — trace the genre roots of what drew you in."
+
+    # Rule 4: Low volume
+    if total_recent < 20:
+        return "mood", "Light listening lately — mood-based discovery matches low-energy exploration."
+
+    # Rule 6: Default
+    return "finish", "Finish mode always has candidates ready."
+
+
+def _build_listening_state(recent_rows, top_recent):
+    """Build a 1-2 sentence natural language summary of listening state."""
+    if not recent_rows or not top_recent:
+        return "No recent listening data available."
+
+    # Count artist plays in recent
+    artist_plays = {}
+    for r in recent_rows:
+        a = r.get("raw_artist", "")
+        artist_plays[a] = artist_plays.get(a, 0) + 1
+
+    top3 = sorted(artist_plays.items(), key=lambda x: -x[1])[:3]
+    top3_str = ", ".join(f"{name} ({count})" for name, count in top3)
+
+    unique_artists = len(artist_plays)
+    total = sum(artist_plays.values())
+
+    # Concentration assessment
+    if top3 and top3[0][1] / max(total, 1) > 0.30:
+        concentration = f"Concentrated on {top3[0][0]}."
+    elif unique_artists > 15:
+        concentration = "Diverse listening across many artists."
+    else:
+        concentration = "Moderate variety."
+
+    return f"{concentration} Top recent: {top3_str}. {unique_artists} unique artists in window."
+
+
+@app.get("/api/session-start")
+async def session_start(
+    format: str = Query(default="compact", pattern="^(compact|full)$"),
+    _=Depends(verify_key),
+):
+    # Run all queries concurrently
+    recent_task = fetch("""
+        SELECT raw_title, raw_artist, raw_album, listened_at
+        FROM listen_events ORDER BY listened_at DESC LIMIT 50
+    """)
+    top_recent_task = fetch("""
+        SELECT raw_artist, COUNT(*) AS listen_count,
+               COUNT(DISTINCT raw_title) AS unique_tracks
+        FROM listen_events
+        WHERE listened_at >= NOW() - INTERVAL '30 days'
+        GROUP BY raw_artist ORDER BY listen_count DESC LIMIT 10
+    """)
+    top_alltime_task = fetch("""
+        SELECT raw_artist, COUNT(*) AS listen_count,
+               COUNT(DISTINCT raw_title) AS unique_tracks
+        FROM listen_events
+        GROUP BY raw_artist ORDER BY listen_count DESC LIMIT 10
+    """)
+    summary_task = fetchrow("""
+        SELECT COUNT(*) AS total_listens,
+               COUNT(DISTINCT raw_artist) AS unique_artists
+        FROM listen_events
+    """)
+    interests_task = fetch("""
+        SELECT cs.show_id, cs.artist_name, cs.venue_name, cs.show_date,
+               si.status AS interest_status, si.note
+        FROM show_interests si
+        JOIN chicago_shows cs ON cs.show_id = si.show_id
+        WHERE cs.show_date >= CURRENT_DATE
+        ORDER BY cs.show_date ASC LIMIT 20
+    """)
+
+    recent_rows, top_recent, top_alltime, summary_row, interests = await asyncio.gather(
+        recent_task, top_recent_task, top_alltime_task, summary_task, interests_task
+    )
+
+    mode_id, mode_reason = _suggest_mode(recent_rows, top_recent, top_alltime)
+
+    if format == "full":
+        return {
+            "recent": recent_rows[:20],
+            "top_artists_recent": top_recent,
+            "top_artists_alltime": top_alltime,
+            "summary": summary_row or {},
+            "tracked_shows": interests,
+            "suggested_mode": {"id": mode_id, "reason": mode_reason},
+        }
+
+    # Compact format
+    listening_state = _build_listening_state(recent_rows, top_recent)
+    recent_summary_lines = []
+    for r in recent_rows[:20]:
+        a = r.get("raw_artist", "?")
+        t = r.get("raw_title", "?")
+        alb = r.get("raw_album", "")
+        alb_part = f" ({alb})" if alb else ""
+        ts = r.get("listened_at")
+        ts_str = _fmt_ts(ts) if ts else ""
+        recent_summary_lines.append(f"{ts_str} {a} - {t}{alb_part}")
+    recent_text = "\n".join(recent_summary_lines)
+
+    top_recent_str = compact_top_artists(top_recent)
+    top_alltime_str = compact_top_artists(top_alltime)
+
+    tracked = []
+    for row in interests:
+        tracked.append({
+            "show_id": row["show_id"],
+            "artist": row["artist_name"],
+            "venue": row["venue_name"],
+            "date": row["show_date"].isoformat() if row["show_date"] else None,
+            "status": row["interest_status"],
+            "note": row.get("note"),
+        })
+
+    return {
+        "listening_state": listening_state,
+        "suggested_mode": {"id": mode_id, "reason": mode_reason},
+        "recent_summary": recent_text,
+        "top_artists_recent": top_recent_str,
+        "top_artists_alltime": top_alltime_str,
+        "tracked_shows": tracked,
+        "total_listens": summary_row["total_listens"] if summary_row else 0,
+        "unique_artists": summary_row["unique_artists"] if summary_row else 0,
+    }
+
+
+# ============================================================
 # Summary
 # ============================================================
 
@@ -195,7 +368,8 @@ async def top_artists(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     days: Optional[int] = None,
-    limit: int = Query(default=50, le=1000),
+    limit: int = Query(default=10, le=1000),
+    format: str = Query(default="compact", pattern="^(compact|json)$"),
     _=Depends(verify_key),
 ):
     df = _df(start_date, end_date, days, limit)
@@ -217,6 +391,8 @@ async def top_artists(
         ORDER BY listen_count DESC
         LIMIT ${idx}
     """, *params, df.limit)
+    if format == "compact":
+        return PlainTextResponse(compact_top_artists(rows))
     return {"artists": rows, "filters": df.as_dict()}
 
 
@@ -230,7 +406,8 @@ async def top_tracks(
     end_date: Optional[str] = None,
     days: Optional[int] = None,
     artist: Optional[str] = None,
-    limit: int = Query(default=50, le=1000),
+    limit: int = Query(default=10, le=1000),
+    format: str = Query(default="compact", pattern="^(compact|json)$"),
     _=Depends(verify_key),
 ):
     df = _df(start_date, end_date, days, limit)
@@ -258,6 +435,8 @@ async def top_tracks(
         ORDER BY listen_count DESC
         LIMIT ${idx}
     """, *params, df.limit)
+    if format == "compact":
+        return PlainTextResponse(compact_top_tracks(rows))
     return {"tracks": rows, "filters": {**df.as_dict(), "artist": artist}}
 
 
@@ -271,7 +450,8 @@ async def top_albums(
     end_date: Optional[str] = None,
     days: Optional[int] = None,
     artist: Optional[str] = None,
-    limit: int = Query(default=50, le=1000),
+    limit: int = Query(default=10, le=1000),
+    format: str = Query(default="compact", pattern="^(compact|json)$"),
     _=Depends(verify_key),
 ):
     df = _df(start_date, end_date, days, limit)
@@ -300,6 +480,8 @@ async def top_albums(
         ORDER BY listen_count DESC
         LIMIT ${idx}
     """, *params, df.limit)
+    if format == "compact":
+        return PlainTextResponse(compact_top_albums(rows))
     return {"albums": rows, "filters": {**df.as_dict(), "artist": artist}}
 
 
@@ -339,7 +521,8 @@ async def timeline(
 
 @app.get("/api/recent")
 async def recent(
-    limit: int = Query(default=50, le=500),
+    limit: int = Query(default=20, le=500),
+    format: str = Query(default="compact", pattern="^(compact|json)$"),
     _=Depends(verify_key),
 ):
     rows = await fetch("""
@@ -349,6 +532,8 @@ async def recent(
         ORDER BY listened_at DESC
         LIMIT $1
     """, limit)
+    if format == "compact":
+        return PlainTextResponse(compact_recent(rows))
     return {"listens": rows}
 
 
@@ -406,7 +591,8 @@ async def album_completion(
     days: Optional[int] = None,
     min_completion: Optional[float] = None,
     max_completion: Optional[float] = None,
-    limit: int = Query(default=50, le=1000),
+    limit: int = Query(default=10, le=1000),
+    format: str = Query(default="compact", pattern="^(compact|json)$"),
     _=Depends(verify_key),
 ):
     df = _df(start_date, end_date, days, limit)
@@ -463,6 +649,8 @@ async def album_completion(
         if len(results) >= df.limit:
             break
 
+    if format == "compact":
+        return PlainTextResponse(compact_album_completion(results))
     return {
         "albums": results,
         "filters": {
@@ -772,7 +960,8 @@ async def chicago_shows(
     genre: Optional[str] = None,
     festival: Optional[str] = None,
     status: Optional[str] = Query(default="upcoming", pattern="^(upcoming|sold_out|cancelled|past|all)$"),
-    limit: int = Query(default=50, le=1000),
+    limit: int = Query(default=20, le=1000),
+    format: str = Query(default="compact", pattern="^(compact|json)$"),
     _=Depends(verify_key),
 ):
     df = _df(start_date, end_date, days, limit)
@@ -840,6 +1029,8 @@ async def chicago_shows(
         }
         shows.append(show)
 
+    if format == "compact":
+        return PlainTextResponse(compact_chicago_shows(shows))
     return {"shows": shows, "count": len(shows), "filters": {**df.as_dict(), "venue": venue, "artist": artist, "genre": genre, "festival": festival, "status": status}}
 
 
@@ -920,7 +1111,8 @@ async def chicago_match(
     min_listens: int = Query(default=1),
     genre: Optional[str] = None,
     festival: Optional[str] = None,
-    limit: int = Query(default=50, le=1000),
+    limit: int = Query(default=15, le=1000),
+    format: str = Query(default="compact", pattern="^(compact|json)$"),
     _=Depends(verify_key),
 ):
     df = _df(start_date, end_date, days, limit)
@@ -1053,6 +1245,8 @@ async def chicago_match(
         SELECT COUNT(*) FROM chicago_shows cs {where}
     """, *params[:where_param_count])
 
+    if format == "compact":
+        return PlainTextResponse(compact_chicago_shows_match(matches))
     return {
         "matches": matches,
         "unmatched_count": (total_upcoming or 0) - len(matches),
@@ -1157,9 +1351,10 @@ async def list_interests(
 async def discover(
     seed: str = Query(..., description="Seed artist name"),
     include_events: bool = Query(default=True),
-    max_similar: int = Query(default=20, le=100),
+    max_similar: int = Query(default=15, le=100),
     exclude_heard: bool = Query(default=False),
     genre: Optional[str] = None,
+    format: str = Query(default="compact", pattern="^(compact|json)$"),
     _=Depends(verify_key),
 ):
     pool = await get_pool()
@@ -1289,7 +1484,7 @@ async def discover(
         for artist in similar_artists:
             del artist["norm_artist"]
 
-    return {
+    result = {
         "seed_artist": seed,
         "seed_norm": norm_seed,
         "seed_stats": {
@@ -1308,6 +1503,9 @@ async def discover(
             "genre": genre,
         },
     }
+    if format == "compact":
+        return PlainTextResponse(compact_discover(result))
+    return result
 
 
 # ============================================================
