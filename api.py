@@ -41,6 +41,11 @@ async def startup():
         await conn.execute("""
             ALTER TABLE chicago_shows ADD COLUMN IF NOT EXISTS festival_name TEXT
         """)
+        # Ensure venues table exists
+        venues_sql = os.path.join(os.path.dirname(__file__), "sql", "venues.sql")
+        if os.path.exists(venues_sql):
+            with open(venues_sql) as f:
+                await conn.execute(f.read())
         # Always update the normalize_artist function (fixes LOWER() ordering)
         await conn.execute("""
             CREATE OR REPLACE FUNCTION normalize_artist(name TEXT) RETURNS TEXT AS $$
@@ -876,7 +881,7 @@ async def chicago_match(
 
     where = "WHERE " + " AND ".join(clauses)
 
-    # Single query: normalize only the ~3K show rows, then PK join to precomputed stats
+    # Single query: normalize show rows, join to stats + venue travel data
     rows = await fetch(f"""
         WITH upcoming AS (
             SELECT DISTINCT cs.show_id, cs.artist_name, cs.venue_name, cs.show_date, cs.show_time,
@@ -888,13 +893,22 @@ async def chicago_match(
             FROM chicago_shows cs
             {genre_join}
             {where}
+        ),
+        travel_range AS (
+            SELECT COALESCE(MIN(travel_best_min), 0) AS tmin,
+                   COALESCE(MAX(travel_best_min), 60) AS tmax
+            FROM venues
         )
         SELECT u.*,
                als.total_listens, als.unique_tracks, als.unique_albums,
-               als.last_listen, als.listens_90d, als.listens_365d, als.top_album
+               als.last_listen, als.listens_90d, als.listens_365d, als.top_album,
+               v.travel_driving_min, v.travel_transit_min, v.travel_best_min,
+               tr.tmin AS travel_min_all, tr.tmax AS travel_max_all
         FROM upcoming u
         JOIN artist_listen_stats als ON als.norm_artist = u.norm_artist
             AND als.norm_artist != ''
+        LEFT JOIN venues v ON LOWER(v.venue_name) = LOWER(u.venue_name)
+        CROSS JOIN travel_range tr
         WHERE als.total_listens >= ${min_idx}
         ORDER BY
             LN(als.total_listens + 1)
@@ -904,6 +918,8 @@ async def chicago_match(
                 WHEN als.listens_365d > 0 THEN 2.0
                 ELSE 1.0
               END
+            * (1.0 - 0.3 * (COALESCE(v.travel_best_min, tr.tmax) - tr.tmin)::FLOAT
+                           / GREATEST(tr.tmax - tr.tmin, 1))
             DESC
         LIMIT ${limit_idx}
     """, *params)
@@ -915,7 +931,11 @@ async def chicago_match(
         tracks = row["unique_tracks"]
         track_factor = min(tracks / 5.0, 3.0)
         recency = 3.0 if row["listens_90d"] > 0 else (2.0 if row["listens_365d"] > 0 else 1.0)
-        score = round(math.log(total + 1) * track_factor * recency, 1)
+        tmin = row.get("travel_min_all") or 0
+        tmax = row.get("travel_max_all") or 60
+        travel_min = row.get("travel_best_min")
+        travel_factor = 1.0 - 0.3 * ((travel_min if travel_min is not None else tmax) - tmin) / max(tmax - tmin, 1)
+        score = round(math.log(total + 1) * track_factor * recency * travel_factor, 1)
 
         matches.append({
             "show": {
@@ -926,6 +946,11 @@ async def chicago_match(
                     "presale_end", "onsale_date", "festival_name",
                     "status", "first_seen", "last_verified",
                 ]
+            },
+            "travel": {
+                "driving_min": row.get("travel_driving_min"),
+                "transit_min": row.get("travel_transit_min"),
+                "best_min": row.get("travel_best_min"),
             },
             "listening_stats": {
                 "total_listens": row["total_listens"],
@@ -1051,8 +1076,10 @@ async def discover(
                 SELECT
                     normalize_artist(cs.artist_name) AS norm_artist,
                     cs.show_id, cs.artist_name, cs.venue_name, cs.show_date,
-                    cs.show_time, cs.ticket_url, cs.festival_name, cs.status
+                    cs.show_time, cs.ticket_url, cs.festival_name, cs.status,
+                    v.travel_best_min, v.travel_driving_min, v.travel_transit_min
                 FROM chicago_shows cs
+                LEFT JOIN venues v ON LOWER(v.venue_name) = LOWER(cs.venue_name)
                 WHERE normalize_artist(cs.artist_name) = ANY($1)
                   AND cs.show_date >= CURRENT_DATE
                   AND cs.status = 'upcoming'
@@ -1069,6 +1096,11 @@ async def discover(
                     "time": sr["show_time"].isoformat() if sr["show_time"] else None,
                     "ticket_url": sr["ticket_url"],
                     "festival_name": sr["festival_name"],
+                    "travel": {
+                        "driving_min": sr["travel_driving_min"],
+                        "transit_min": sr["travel_transit_min"],
+                        "best_min": sr["travel_best_min"],
+                    },
                 })
 
             for artist in similar_artists:
