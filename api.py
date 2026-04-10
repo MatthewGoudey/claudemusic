@@ -7,6 +7,7 @@ Usage:
 
 import asyncio
 import logging
+from datetime import date, timedelta
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Query
@@ -17,6 +18,7 @@ from src.auth import verify_key
 from src.filters import parse_date_filter, DateFilter
 from src.musicbrainz import resolve_single, resolve_all_missing, get_resolution_status
 from src.schema_registry import SCHEMA
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +27,16 @@ app = FastAPI(title="Music Listening API", version="0.2.0")
 
 @app.on_event("startup")
 async def startup():
-    await get_pool()
+    pool = await get_pool()
+    # Ensure chicago_shows table exists
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval("SELECT to_regclass('public.chicago_shows')")
+        if exists is None:
+            import os
+            sql_path = os.path.join(os.path.dirname(__file__), "sql", "chicago_shows.sql")
+            with open(sql_path) as f:
+                await conn.execute(f.read())
+            logger.info("Created chicago_shows table")
 
 
 @app.on_event("shutdown")
@@ -678,3 +689,228 @@ async def adhoc_query(body: dict, _=Depends(verify_key)):
         raise HTTPException(status_code=400, detail=str(e))
 
     return {"results": rows, "count": len(rows)}
+
+
+# ============================================================
+# Chicago shows
+# ============================================================
+
+@app.get("/api/chicago-shows")
+async def chicago_shows(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    days: Optional[int] = None,
+    venue: Optional[str] = None,
+    artist: Optional[str] = None,
+    status: Optional[str] = Query(default="upcoming", pattern="^(upcoming|sold_out|cancelled|past|all)$"),
+    limit: int = Query(default=50, le=1000),
+    _=Depends(verify_key),
+):
+    df = _df(start_date, end_date, days, limit)
+    clauses, params = df.build_where(col="show_date")
+
+    # Default to today onward if no date filter specified
+    if not df.effective_start and not df.effective_end:
+        idx = len(params) + 1
+        clauses.append(f"show_date >= ${idx}")
+        params.append(date.today())
+
+    if status and status != "all":
+        idx = len(params) + 1
+        clauses.append(f"status = ${idx}")
+        params.append(status)
+
+    if venue:
+        idx = len(params) + 1
+        clauses.append(f"LOWER(venue_name) %% LOWER(${idx})")
+        params.append(venue)
+
+    if artist:
+        idx = len(params) + 1
+        clauses.append(f"LOWER(artist_name) %% LOWER(${idx})")
+        params.append(artist)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    idx = len(params) + 1
+
+    rows = await fetch(f"""
+        SELECT show_id, artist_name, venue_name, show_date, show_time, doors_time,
+               support_acts, ticket_url, ticket_price, age_restriction,
+               sources, presale_name, presale_start, presale_end, onsale_date,
+               status, first_seen, last_verified
+        FROM chicago_shows
+        {where}
+        ORDER BY show_date ASC, show_time ASC NULLS LAST
+        LIMIT ${idx}
+    """, *params, df.limit)
+
+    return {"shows": rows, "count": len(rows), "filters": {**df.as_dict(), "venue": venue, "artist": artist, "status": status}}
+
+
+@app.get("/api/chicago-shows/presales")
+async def chicago_presales(
+    days: Optional[int] = Query(default=14),
+    limit: int = Query(default=50, le=1000),
+    _=Depends(verify_key),
+):
+    rows = await fetch("""
+        SELECT show_id, artist_name, venue_name, show_date, show_time,
+               ticket_url, ticket_price, presale_name, presale_start, presale_end,
+               onsale_date, sources, first_seen
+        FROM chicago_shows
+        WHERE presale_start IS NOT NULL
+          AND presale_start > NOW() - INTERVAL '1 day'
+          AND presale_start < NOW() + MAKE_INTERVAL(days => $1)
+          AND status = 'upcoming'
+        ORDER BY presale_start ASC
+        LIMIT $2
+    """, days, limit)
+
+    return {"presales": rows, "count": len(rows), "filters": {"days": days}}
+
+
+@app.get("/api/chicago-shows/just-announced")
+async def chicago_just_announced(
+    days: Optional[int] = Query(default=7),
+    limit: int = Query(default=50, le=1000),
+    _=Depends(verify_key),
+):
+    rows = await fetch("""
+        SELECT show_id, artist_name, venue_name, show_date, show_time,
+               ticket_url, ticket_price, sources, first_seen, status
+        FROM chicago_shows
+        WHERE first_seen > NOW() - MAKE_INTERVAL(days => $1)
+          AND show_date >= CURRENT_DATE
+        ORDER BY first_seen DESC
+        LIMIT $2
+    """, days, limit)
+
+    return {"shows": rows, "count": len(rows), "filters": {"days": days}}
+
+
+@app.get("/api/chicago-shows/match")
+async def chicago_match(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    days: Optional[int] = None,
+    min_listens: int = Query(default=1),
+    limit: int = Query(default=50, le=1000),
+    _=Depends(verify_key),
+):
+    df = _df(start_date, end_date, days, limit)
+
+    # Build show date filter
+    show_clauses, show_params = [], []
+    if df.effective_start:
+        show_clauses.append(f"cs.show_date >= ${len(show_params) + 1}")
+        show_params.append(df.effective_start.date() if hasattr(df.effective_start, 'date') else df.effective_start)
+    else:
+        show_clauses.append(f"cs.show_date >= ${len(show_params) + 1}")
+        show_params.append(date.today())
+
+    if df.effective_end:
+        show_clauses.append(f"cs.show_date <= ${len(show_params) + 1}")
+        show_params.append(df.effective_end.date() if hasattr(df.effective_end, 'date') else df.effective_end)
+    else:
+        show_clauses.append(f"cs.show_date <= ${len(show_params) + 1}")
+        show_params.append(date.today() + timedelta(days=90))
+
+    show_clauses.append("cs.status = 'upcoming'")
+    where = "WHERE " + " AND ".join(show_clauses)
+
+    # Get all upcoming shows with normalized artist names
+    shows = await fetch(f"""
+        SELECT cs.*, normalize_artist(cs.artist_name) AS norm_artist
+        FROM chicago_shows cs
+        {where}
+        ORDER BY cs.show_date ASC
+    """, *show_params)
+
+    if not shows:
+        return {"matches": [], "unmatched_count": 0, "filters": df.as_dict()}
+
+    # Get distinct normalized artist names from shows
+    norm_artists = list({s["norm_artist"] for s in shows if s["norm_artist"]})
+
+    if not norm_artists:
+        return {"matches": [], "unmatched_count": len(shows), "filters": df.as_dict()}
+
+    # Batch lookup listening stats for all show artists
+    # Build ANY array for efficient matching
+    listening_stats = await fetch("""
+        SELECT
+            normalize_artist(raw_artist) AS norm_artist,
+            raw_artist AS known_as,
+            COUNT(*) AS total_listens,
+            COUNT(DISTINCT raw_title) AS unique_tracks,
+            COUNT(DISTINCT raw_album) FILTER (WHERE raw_album IS NOT NULL) AS unique_albums,
+            MIN(listened_at) AS first_listen,
+            MAX(listened_at) AS last_listen,
+            COUNT(*) FILTER (WHERE listened_at > NOW() - INTERVAL '90 days') AS listens_90d,
+            COUNT(*) FILTER (WHERE listened_at > NOW() - INTERVAL '365 days') AS listens_365d
+        FROM listen_events
+        WHERE normalize_artist(raw_artist) = ANY($1)
+        GROUP BY norm_artist, raw_artist
+    """, norm_artists)
+
+    # Build lookup: norm_artist -> best stats row (highest listen count)
+    stats_map: dict[str, dict] = {}
+    for row in listening_stats:
+        na = row["norm_artist"]
+        if na not in stats_map or row["total_listens"] > stats_map[na]["total_listens"]:
+            stats_map[na] = row
+
+    # Score and rank matches
+    matches = []
+    unmatched = 0
+
+    for show in shows:
+        stats = stats_map.get(show["norm_artist"])
+        if not stats or stats["total_listens"] < min_listens:
+            unmatched += 1
+            continue
+
+        # Relevance score: log(listens) * track breadth * recency boost
+        total = stats["total_listens"]
+        tracks = stats["unique_tracks"]
+        track_factor = min(tracks / 5.0, 3.0)  # caps at 15 unique tracks
+        recency = 1.0
+        if stats["listens_90d"] > 0:
+            recency = 3.0
+        elif stats["listens_365d"] > 0:
+            recency = 2.0
+        score = round(math.log(total + 1) * track_factor * recency, 1)
+
+        # Get top album for context
+        top_album = await fetchrow("""
+            SELECT raw_album, COUNT(*) AS cnt
+            FROM listen_events
+            WHERE normalize_artist(raw_artist) = $1 AND raw_album IS NOT NULL
+            GROUP BY raw_album
+            ORDER BY cnt DESC
+            LIMIT 1
+        """, show["norm_artist"])
+
+        # Remove the norm_artist working field from show output
+        show_out = {k: v for k, v in show.items() if k != "norm_artist"}
+
+        matches.append({
+            "show": show_out,
+            "listening_stats": {
+                "total_listens": stats["total_listens"],
+                "unique_tracks": stats["unique_tracks"],
+                "unique_albums": stats["unique_albums"],
+                "last_listen": stats["last_listen"].isoformat() if stats["last_listen"] else None,
+                "top_album": top_album["raw_album"] if top_album else None,
+            },
+            "relevance_score": score,
+        })
+
+    matches.sort(key=lambda m: m["relevance_score"], reverse=True)
+    matches = matches[:df.limit]
+
+    return {
+        "matches": matches,
+        "unmatched_count": unmatched,
+        "filters": {**df.as_dict(), "min_listens": min_listens},
+    }

@@ -168,5 +168,53 @@ SCHEMA = {
             "body": {"sql": "SELECT ...", "limit": 100},
             "auth": True,
         },
+        {
+            "route": "/api/chicago-shows",
+            "method": "GET",
+            "description": "Upcoming Chicago concerts — query by date range, venue, artist. Trigram fuzzy matching on artist/venue names.",
+            "params": {
+                "start_date": {"type": "ISO date string", "required": False, "default": "today"},
+                "end_date": {"type": "ISO date string", "required": False},
+                "days": {"type": "int", "required": False},
+                "venue": {"type": "string", "required": False, "description": "Fuzzy match venue name"},
+                "artist": {"type": "string", "required": False, "description": "Fuzzy match artist name"},
+                "status": {"type": "string", "required": False, "default": "upcoming", "enum": ["upcoming", "sold_out", "cancelled", "past", "all"]},
+                "limit": {"type": "int", "required": False, "default": 50, "max": 1000},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/chicago-shows/presales",
+            "method": "GET",
+            "description": "Upcoming presales sorted by presale start date (Ticketmaster-sourced shows only)",
+            "params": {
+                "days": {"type": "int", "required": False, "default": 14, "description": "Presales starting within N days"},
+                "limit": {"type": "int", "required": False, "default": 50, "max": 1000},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/chicago-shows/just-announced",
+            "method": "GET",
+            "description": "Shows first seen in the last N days — new listings across all sources",
+            "params": {
+                "days": {"type": "int", "required": False, "default": 7},
+                "limit": {"type": "int", "required": False, "default": 50, "max": 1000},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/chicago-shows/match",
+            "method": "GET",
+            "description": "Cross-reference upcoming shows against listening history — ranked by relevance score (log(listens) * track breadth * recency). The key endpoint for taste-based show recommendations.",
+            "params": {
+                "start_date": {"type": "ISO date string", "required": False, "default": "today"},
+                "end_date": {"type": "ISO date string", "required": False, "default": "+90 days"},
+                "days": {"type": "int", "required": False},
+                "min_listens": {"type": "int", "required": False, "default": 1, "description": "Minimum lifetime listens to qualify as a match"},
+                "limit": {"type": "int", "required": False, "default": 50, "max": 1000},
+            },
+            "auth": True,
+        },
     ]
 }
