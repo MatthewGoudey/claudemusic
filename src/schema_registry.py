@@ -171,7 +171,7 @@ SCHEMA = {
         {
             "route": "/api/chicago-shows",
             "method": "GET",
-            "description": "Upcoming Chicago concerts — query by date range, venue, artist. Trigram fuzzy matching on artist/venue names.",
+            "description": "Upcoming Chicago concerts and festival lineups — query by date range, venue, artist, festival. Trigram fuzzy matching on artist/venue names.",
             "params": {
                 "start_date": {"type": "ISO date string", "required": False, "default": "today"},
                 "end_date": {"type": "ISO date string", "required": False},
@@ -179,6 +179,7 @@ SCHEMA = {
                 "venue": {"type": "string", "required": False, "description": "Fuzzy match venue name"},
                 "artist": {"type": "string", "required": False, "description": "Fuzzy match artist name"},
                 "genre": {"type": "string", "required": False, "description": "Filter by Last.fm genre tag (e.g. 'post-punk', 'indie rock', 'hip-hop')"},
+                "festival": {"type": "string", "required": False, "description": "Filter by festival name (e.g. 'Lollapalooza 2026', 'ARC Music Festival 2026')"},
                 "status": {"type": "string", "required": False, "default": "upcoming", "enum": ["upcoming", "sold_out", "cancelled", "past", "all"]},
                 "limit": {"type": "int", "required": False, "default": 50, "max": 1000},
             },

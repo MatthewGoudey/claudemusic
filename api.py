@@ -37,6 +37,10 @@ async def startup():
             with open(sql_path) as f:
                 await conn.execute(f.read())
             logger.info("Created chicago_shows table")
+        # Add festival_name column if missing
+        await conn.execute("""
+            ALTER TABLE chicago_shows ADD COLUMN IF NOT EXISTS festival_name TEXT
+        """)
         # Always update the normalize_artist function (fixes LOWER() ordering)
         await conn.execute("""
             CREATE OR REPLACE FUNCTION normalize_artist(name TEXT) RETURNS TEXT AS $$
@@ -729,6 +733,7 @@ async def chicago_shows(
     venue: Optional[str] = None,
     artist: Optional[str] = None,
     genre: Optional[str] = None,
+    festival: Optional[str] = None,
     status: Optional[str] = Query(default="upcoming", pattern="^(upcoming|sold_out|cancelled|past|all)$"),
     limit: int = Query(default=50, le=1000),
     _=Depends(verify_key),
@@ -757,6 +762,11 @@ async def chicago_shows(
         clauses.append(f"LOWER(cs.artist_name) %% LOWER(${idx})")
         params.append(artist)
 
+    if festival:
+        idx = len(params) + 1
+        clauses.append(f"LOWER(cs.festival_name) = LOWER(${idx})")
+        params.append(festival)
+
     genre_join = ""
     if genre:
         idx = len(params) + 1
@@ -771,7 +781,7 @@ async def chicago_shows(
         SELECT DISTINCT cs.show_id, cs.artist_name, cs.venue_name, cs.show_date, cs.show_time,
                cs.doors_time, cs.support_acts, cs.ticket_url, cs.ticket_price, cs.age_restriction,
                cs.sources, cs.presale_name, cs.presale_start, cs.presale_end, cs.onsale_date,
-               cs.status, cs.first_seen, cs.last_verified
+               cs.festival_name, cs.status, cs.first_seen, cs.last_verified
         FROM chicago_shows cs
         {genre_join}
         {where}
@@ -779,7 +789,7 @@ async def chicago_shows(
         LIMIT ${idx}
     """, *params, df.limit)
 
-    return {"shows": rows, "count": len(rows), "filters": {**df.as_dict(), "venue": venue, "artist": artist, "genre": genre, "status": status}}
+    return {"shows": rows, "count": len(rows), "filters": {**df.as_dict(), "venue": venue, "artist": artist, "genre": genre, "festival": festival, "status": status}}
 
 
 @app.get("/api/chicago-shows/presales")
@@ -791,7 +801,7 @@ async def chicago_presales(
     rows = await fetch("""
         SELECT show_id, artist_name, venue_name, show_date, show_time,
                ticket_url, ticket_price, presale_name, presale_start, presale_end,
-               onsale_date, sources, first_seen
+               onsale_date, sources, festival_name, first_seen
         FROM chicago_shows
         WHERE presale_start IS NOT NULL
           AND presale_start > NOW() - INTERVAL '1 day'
@@ -812,7 +822,7 @@ async def chicago_just_announced(
 ):
     rows = await fetch("""
         SELECT show_id, artist_name, venue_name, show_date, show_time,
-               ticket_url, ticket_price, sources, first_seen, status
+               ticket_url, ticket_price, sources, festival_name, first_seen, status
         FROM chicago_shows
         WHERE first_seen > NOW() - MAKE_INTERVAL(days => $1)
           AND show_date >= CURRENT_DATE
@@ -872,7 +882,8 @@ async def chicago_match(
             SELECT DISTINCT cs.show_id, cs.artist_name, cs.venue_name, cs.show_date, cs.show_time,
                    cs.doors_time, cs.support_acts, cs.ticket_url, cs.ticket_price,
                    cs.age_restriction, cs.sources, cs.presale_name, cs.presale_start,
-                   cs.presale_end, cs.onsale_date, cs.status, cs.first_seen, cs.last_verified,
+                   cs.presale_end, cs.onsale_date, cs.festival_name,
+                   cs.status, cs.first_seen, cs.last_verified,
                    normalize_artist(cs.artist_name) AS norm_artist
             FROM chicago_shows cs
             {genre_join}
@@ -912,7 +923,8 @@ async def chicago_match(
                     "show_id", "artist_name", "venue_name", "show_date", "show_time",
                     "doors_time", "support_acts", "ticket_url", "ticket_price",
                     "age_restriction", "sources", "presale_name", "presale_start",
-                    "presale_end", "onsale_date", "status", "first_seen", "last_verified",
+                    "presale_end", "onsale_date", "festival_name",
+                    "status", "first_seen", "last_verified",
                 ]
             },
             "listening_stats": {
@@ -1039,7 +1051,7 @@ async def discover(
                 SELECT
                     normalize_artist(cs.artist_name) AS norm_artist,
                     cs.show_id, cs.artist_name, cs.venue_name, cs.show_date,
-                    cs.show_time, cs.ticket_url, cs.status
+                    cs.show_time, cs.ticket_url, cs.festival_name, cs.status
                 FROM chicago_shows cs
                 WHERE normalize_artist(cs.artist_name) = ANY($1)
                   AND cs.show_date >= CURRENT_DATE
@@ -1056,6 +1068,7 @@ async def discover(
                     "date": sr["show_date"].isoformat() if sr["show_date"] else None,
                     "time": sr["show_time"].isoformat() if sr["show_time"] else None,
                     "ticket_url": sr["ticket_url"],
+                    "festival_name": sr["festival_name"],
                 })
 
             for artist in similar_artists:
