@@ -26,6 +26,23 @@ EDITION_EXCLUDE = re.compile(
     re.IGNORECASE,
 )
 
+# Patterns to strip from album names before searching MusicBrainz.
+# Spotify adds these suffixes; MB doesn't use them.
+_ALBUM_CLEAN_PATTERNS = [
+    re.compile(r'\s*\[([^\]]*)\]\s*$'),           # [Standard Edition], [Deluxe], etc.
+    re.compile(r'\s*\(([^)]*(?:edition|remaster|version|deluxe|expanded|anniversary|bonus|mono|stereo|remix|original)[^)]*)\)\s*$', re.IGNORECASE),
+    re.compile(r'\s*[-–—]\s*(EP|Single|Deluxe|Remastered|Bonus Track Version)\s*$', re.IGNORECASE),
+    re.compile(r'\s*\(feat\.[^)]*\)\s*$', re.IGNORECASE),
+]
+
+
+def _clean_album_name(album: str) -> str:
+    """Strip Spotify edition suffixes that prevent MusicBrainz matches."""
+    cleaned = album
+    for pattern in _ALBUM_CLEAN_PATTERNS:
+        cleaned = pattern.sub('', cleaned)
+    return cleaned.strip()
+
 
 async def resolve_album_tracklist(
     client: httpx.AsyncClient,
@@ -37,7 +54,8 @@ async def resolve_album_tracklist(
     Searches the release endpoint, groups results by release-group primary-type,
     prefers Album > EP > Single. Returns (track_count, release_type) or None.
     """
-    query = f'"{album}" AND artist:"{artist}"'
+    clean = _clean_album_name(album)
+    query = f'"{clean}" AND artist:"{artist}"'
     params = {"query": query, "fmt": "json", "limit": "25"}
 
     try:
@@ -53,6 +71,19 @@ async def resolve_album_tracklist(
         return None
 
     releases = data.get("releases", [])
+
+    # Fallback: if exact match returned nothing and we cleaned the name, try unquoted
+    if not releases and clean != album:
+        fallback_query = f'{clean} AND artist:"{artist}"'
+        params["query"] = fallback_query
+        try:
+            await asyncio.sleep(1.1)
+            resp = await client.get(f"{MB_BASE}/release", params=params)
+            resp.raise_for_status()
+            releases = resp.json().get("releases", [])
+        except Exception:
+            pass
+
     if not releases:
         return None
 
