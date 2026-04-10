@@ -1,0 +1,332 @@
+"""
+Exploration mode specifications served as plain text by /api/modes/{mode_id}.
+
+Each mode is a procedural instruction set consumed by Claude at runtime.
+"""
+
+MODES = {
+    "finish": {
+        "name": "Finish What You Started",
+        "description": "Albums with 3+ tracks heard, under 80% completion, never fully completed.",
+        "spec": """\
+Mode: finish_what_you_started
+
+Albums with 3+ tracks heard, under 80% completion, never fully completed.
+Prioritize albums where the user had identifiable partial sessions (actively sat down and stopped).
+
+API Action:
+/api/album-completion min_completion=0.25 max_completion=0.79, sort by completion desc.
+Cross-reference /api/album-sessions?session_type=partial for abandoned mid-listen sessions — these are higher priority.
+
+Source Action:
+Search AOTY and RYM for the album's rating. Prioritize the most critically acclaimed unfinished albums.
+If poorly rated everywhere, note that — sometimes dropping it was the right call.
+
+Output:
+1 release with: completion stats, why it's worth finishing, the first unheard track to restart from, source ratings.""",
+    },
+    "disco": {
+        "name": "Deep Discography",
+        "description": "Pick a high-play artist, find their barely-touched or skipped albums.",
+        "spec": """\
+Mode: deep_discography
+
+Pick a high-play artist (500+ plays) and find their albums the user has barely touched or skipped entirely.
+
+API Action:
+/api/top-artists?limit=20 to identify high-play artists.
+/api/album-completion?artist=[name] for per-album coverage.
+/api/top-tracks?artist=[name] to understand if user cherry-picked singles or explored deep cuts.
+
+Source Action:
+Search RYM for the artist's discography page — community rankings of each album.
+Search AOTY for critic consensus.
+Recommend the highest-rated gap album. If the gap album is a consensus weak entry, say so and pick the next-best gap.
+
+Output:
+1 release with: artist's overall play depth, which albums are well-covered vs missing, the specific gap album, critical context for its place in the discography.""",
+    },
+    "gap": {
+        "name": "Gap Fill",
+        "description": "Address known canonical gaps — foundational albums the user knows they're missing.",
+        "spec": """\
+Mode: gap_fill
+
+Address known canonical gaps — foundational albums the user knows they're missing.
+
+Known gaps:
+- lo-fi/slacker rock: Sebadoh, Liz Phair (Exile in Guyville), Pavement (Slanted and Enchanted deep listen — only 9 plays)
+- alt-rock: Pre-1991 formation layer, Sonic Youth, shoegaze crossover
+- alt-country: No Depression core — Uncle Tupelo, early Wilco, Whiskeytown, Drive-By Truckers
+- corridos tumbados: Traditional corrido foundation beyond Chalino and Los Tigres
+- country-punk: Beyond Clash/Pogues/Amigo the Devil — Mekons, X, Jason and the Scorchers, Hank III
+
+API Action:
+Confirm the gap still exists by querying the specific artist/album. If they've since listened, update and pick the next gap.
+
+Source Action:
+Search the genre-specific publication (No Depression for alt-country, BrooklynVegan for punk crossover, etc.) for "essential" or "canon" lists.
+Cross-reference with RYM genre charts and Rolling Stone genre lists.
+Identify the single most important gap album with full historical context.
+
+Jumping Off:
+Always start with a familiar album: "You know [familiar album] well ([X] plays). [Gap album] is [specific connection]."
+
+Output:
+1 release with: the gap it fills, jumping-off connection, historical context (label, producer, scene, year), confirmed starting track.""",
+    },
+    "roots": {
+        "name": "Root Tracing",
+        "description": "Go backward from a genre the user loves to its foundational layer.",
+        "spec": """\
+Mode: root_tracing
+
+Go backward from a genre the user loves to its foundational layer. Work forward chronologically from the root.
+
+API Action:
+Identify which era of a genre the user is heaviest in (e.g., 2000s alt-rock revival, modern outlaw country).
+Query play counts for artists from earlier eras of the same genre to quantify the historical gap.
+
+Source Action (uses the most sources):
+1. Rolling Stone or Acclaimed Music genre retrospectives for canonical historical sequence
+2. RYM genre charts filtered to the foundational decade
+3. Genre-specific publication's "history of" or "beginner's guide" features
+4. Pitchfork Sunday Reviews for older albums that influenced the user's favorites
+Build a lineage map: [root artist] → [bridge artist] → [artist user already loves].
+
+Output:
+1 release from the root layer with: full lineage chain, historical context, era placement, confirmed starting track.""",
+    },
+    "scene": {
+        "name": "Scene Exploration",
+        "description": "Lock onto a specific city/label/era ecosystem and explore it as a network.",
+        "spec": """\
+Mode: scene_exploration
+
+Lock onto a specific city/label/era ecosystem and explore it as a network — labels, venues, producers, not just artists.
+
+Suggested scenes:
+- Chicago post-rock (Thrill Jockey, Drag City, 1990s-2000s)
+- Merge Records roster (Chapel Hill/Durham, indie rock institution)
+- Bakersfield Sound (Buck Owens, Merle Haggard, 1950s-60s)
+- Sinaloan corrido scene (Chalino's Culiacán through modern tumbados)
+- 4AD Records (shoegaze/dream pop/ethereal, 1980s-90s UK)
+- Dischord Records (DC hardcore/post-hardcore, Ian MacKaye's label)
+- Pilsen/Chicago DIY (local to user)
+- Muscle Shoals / FAME Studios (soul/R&B/country crossover, Alabama)
+- Warp Records (electronic/IDM/experimental, Sheffield UK)
+
+Source Action:
+Discogs for label discography. Bandcamp Daily or genre-specific publication for scene reports. RYM for label pages and curated scene lists.
+Map the ecosystem: key label(s), producer(s), venue(s), active years, defining aesthetic, 3-5 essential releases ranked by critical consensus.
+
+Output:
+Scene overview (3-5 sentences of infrastructure context) plus 1 entry-point release with connections to other scene releases for future sessions.""",
+    },
+    "bridge": {
+        "name": "Bridge Building",
+        "description": "Find artists at the intersection of two genres the user is already into.",
+        "spec": """\
+Mode: bridge_building
+
+Find artists at the intersection of two genres the user is already into. The interesting music lives in the overlaps.
+
+API Action:
+Identify the user's top 5 genres by total play count.
+Look for artists that appear in RYM under descriptors from two of these genres simultaneously.
+
+Source Action:
+Search RYM for albums tagged with both genre descriptors.
+Search Bandcamp Daily for cross-genre features.
+Search for "[genre A] meets [genre B]" on Pitchfork or the relevant genre publication.
+Prioritize albums that appear on lists for BOTH genres.
+
+Intersection examples:
+- Alt-country × post-rock (Calexico, Boxhead Ensemble)
+- Corridos × punk (the Plugz, Piñata Protest)
+- Slacker rock × folk (early Smog, Songs: Ohia)
+- Hip-hop × jazz (Madlib side projects, Shabaka Hutchings crossover)
+- Post-punk × Latin (Arto Lindsay, Mars)
+- Electronic × country (Sturgill's Sound & Fury, Charley Crockett remixes)
+
+Output:
+1 release with: the two genres it bridges, how it sounds from each side, specific connections to artists the user already knows from each genre.""",
+    },
+    "adjacent": {
+        "name": "Adjacent Genre",
+        "description": "Identify unexplored genres that border genres the user is deep in.",
+        "spec": """\
+Mode: adjacent_genre
+
+Identify unexplored genres that border genres the user is deep in, and provide an entry point.
+
+API Action:
+Pull top-artists to identify 5 strongest genres.
+Cross-reference the 42-genre guide to find genres with zero or near-zero plays that share sonic DNA.
+
+Source Action:
+Search Every Noise at Once or RYM genre map for adjacency relationships.
+For the target genre, search AOTY, RYM, and Rolling Stone for the consensus #1 entry-point album.
+Search the genre-specific publication for a "where to start" feature.
+If 3 sources agree on the same entry point, that's the recommendation. If sources diverge, present top 2.
+
+Adjacency logic:
+- Strong in indie/alt-rock → post-rock, math rock, slowcore, power pop
+- Strong in alt-country → Americana, Red Dirt, cosmic American music, folk
+- Strong in corridos → Tejano, son jarocho, norteño deep cuts, narco-ballad history
+- Strong in post-punk → darkwave, coldwave, industrial, no wave
+- Strong in hip-hop → grime, UK drill, abstract hip-hop, spoken word/jazz poetry
+- Strong in electronic → dub techno, Krautrock, ambient, musique concrète
+
+Output:
+Genre name, why it's adjacent to user's taste, consensus entry-point album, 1 confirmed track.""",
+    },
+    "mood": {
+        "name": "Mood / Sonic",
+        "description": "Cross-genre recommendations based on texture, energy, and emotional register.",
+        "spec": """\
+Mode: mood_sonic
+
+Cross-genre recommendations based on texture, energy, and emotional register — not genre taxonomy.
+
+API Action:
+Pull /api/recent to understand current listening mood.
+Identify sonic qualities: tempo, density, vocal style, production era, emotional register.
+
+Sonic dimensions:
+- Energy: catatonic → contemplative → steady → driving → explosive
+- Density: sparse/skeletal → open → full → dense → wall-of-sound
+- Warmth: cold/clinical → neutral → warm → lush → saturated
+- Vocals: instrumental → buried/textural → conversational → melodic → operatic
+- Production era: lo-fi/raw → vintage analog → clean digital → maximalist → futuristic
+
+Source Action:
+Search RYM by descriptors (not genres). Search Bandcamp tags. Use AOTY to find highly-rated albums matching those descriptors from genres the user hasn't explored.
+
+Output:
+1 release with: sonic profile match, mood fit rationale, genre-crossing connection ("this is from [genre] but shares [quality] with the [genre] you've been playing").""",
+    },
+    "cold": {
+        "name": "Cold Discovery",
+        "description": "Zero existing listens on the recommended artist. Maximum distance from the comfort zone.",
+        "spec": """\
+Mode: cold_discovery
+
+Zero existing listens on the recommended artist. Maximum distance from the comfort zone, but with a rationale rooted in taste analysis.
+
+API Action:
+Pull top-artists and recent listening.
+Identify taste patterns: what sonic qualities, lyrical themes, or production approaches recur across favorites regardless of genre.
+
+Source Action (widest source net):
+1. AOTY highest-rated current/recent year in genres with zero user plays
+2. RYM genre charts for genres outside user's top 10
+3. Bandcamp Daily for features on unfamiliar scenes
+4. 1001 Albums list for entries from underrepresented genres/regions
+5. Acclaimed Music for highly-ranked albums from genres with zero plays
+Cross-reference: find an album with zero listens, multiple high source ratings, AND a connection to at least one quality in existing taste.
+
+Jumping Off:
+Even in cold discovery, start with a familiar album:
+"You have zero listens in [genre], but you've played [familiar album] [X] times. That album's [specific quality] connects to [cold rec] because [concrete reason]."
+
+Output:
+1 release with: full context for why this specific listener would connect, jumping-off connection, source ratings, confirmed starting track.""",
+    },
+    "revisit": {
+        "name": "Revisit",
+        "description": "Albums listened to heavily in the past but not played in 6+ months.",
+        "spec": """\
+Mode: revisit
+
+Albums the user listened to heavily in the past but hasn't played in 6+ months. Things that might hit differently now.
+
+API Action:
+Use /api/album-sessions?session_type=full for albums with completed listens.
+Cross-reference /api/album-completion for total play depth.
+Use /api/query with SQL:
+SELECT raw_artist, raw_album, COUNT(*) as plays, MAX(listened_at) as last_played
+FROM listen_events GROUP BY raw_artist, raw_album
+HAVING COUNT(*) >= 10 AND MAX(listened_at) < NOW() - INTERVAL '6 months'
+ORDER BY plays DESC.
+
+Source Action:
+Search for recent retrospective coverage, anniversary features, or reappraisals.
+Check if the artist released new work since the user last listened — new context can reframe older albums.
+
+Output:
+1 release with: play history stats, time since last listen, what's changed since then, case for why now is a good time to return.""",
+    },
+    "live": {
+        "name": "Live Shows",
+        "description": "Find upcoming Chicago shows based on listening history, track presales, manage interest.",
+        "spec": """\
+Mode: live_shows
+
+Find upcoming Chicago shows the user should attend based on listening history, discover new artists with upcoming local dates, track presales, and manage show interest.
+
+API Action:
+Primary: /api/chicago-shows/match with target date range (default: next 4 weeks, expandable to 3 months or full year). Returns shows ranked by relevance score (listen count × track breadth × recency × proximity) with artist listening stats included.
+
+Supplement with:
+- /api/chicago-shows/just-announced — check every session for newly listed shows (last 7 days)
+- /api/chicago-shows/presales — presales starting within 14 days. Flag prominently for action.
+- /api/chicago-shows?genre=[tag] — filter by Last.fm tag for genre browsing
+- /api/discover?seed=[artist]&include_events=true — from interesting matches, find similar artists with upcoming Chicago dates (Tier 3 discovery)
+
+Source Action:
+For matched artists: /api/album-completion?artist=[name] for prep opportunities.
+For discovery artists from /api/discover: search RYM/AOTY for best album. Use the discover endpoint's genre tags and similarity scores for context.
+
+Interest Tracking:
+PUT /api/chicago-shows/interest with show_id + status (going|interested|not_interested|cant_afford) + optional note.
+GET /api/chicago-shows/interest to review tracked shows at session start.
+GET /api/chicago-shows/interest?status=interested for shows the user is on the fence about.
+
+Day Priority:
+Friday/Saturday first — present in full.
+Weekday (Mon-Thu) only if: Tier 1 artist (50+ plays), rare/one-off appearance, or presale/ticket urgency.
+Sunday: Tier 1 + strong Tier 2.
+Group by weekend first, then significant weekday shows.
+
+Output per show:
+Day of week, date, venue, artist(s), time, ticket link.
+Relevance context: listen count, top albums, last listen date.
+Prep recommendation: specific album to listen to before the show.
+Multi-artist bills: note which artists user knows vs doesn't.
+Flag [JUST ANNOUNCED], [PRESALE SOON], [THALIA HALL] where applicable.
+After presenting matches, offer discovery exploration via /api/discover.""",
+    },
+    "festival": {
+        "name": "Festival Scout",
+        "description": "Analyze Chicago festival lineups against listening history, build a prep plan.",
+        "spec": """\
+Mode: festival_scout
+
+Analyze Chicago festival lineups against listening history, identify must-see acts and discovery opportunities, build a prep plan.
+
+API Action:
+Primary: /api/chicago-shows/match?festival=[name] for lineup cross-reference with relevance scores. Fuzzy matching — "lolla", "riot", "arc" all work.
+Full lineup: /api/chicago-shows?festival=[name]&limit=1000.
+Discovery: Pick 3-5 highest-matched artists, run /api/discover?seed=[artist]&include_events=true to find similar artists on the same lineup.
+Unannounced lineups: Fall back to web search "[festival] [year] lineup" then /api/artists/batch.
+
+Source Action:
+For discovery artists: search RYM/AOTY for best album.
+For unannounced festivals: search for announcement dates and presale info.
+Partial lineups: present what's known, flag when full lineup expected.
+
+Interest Tracking:
+Track interest per show/artist — helps decide which day pass to buy.
+
+Key Chicago Festivals:
+Lollapalooza (late Jul/Aug), Riot Fest (mid-Sept), ARC (early Sept), Sueños (May), Pitchfork (check status), Chicago Blues Fest (June, free), Chicago Jazz Fest (Labor Day, free), Chicago House Fest (late Aug, free), World Music Fest (late Sept, free), Windy City Smokeout (July, country), Summer Smash (June, hip-hop), Beyond Wonderland (June, EDM), Ravinia (summer-long), CIVL Fest (April), Tomorrow Never Knows (January).
+
+Output:
+Matched artists by relevance score with listen counts and top albums.
+5-10 discovery picks via /api/discover with genre context and one prep album each.
+Overall score: "X artists you already love, Y started exploring, Z discovery candidates."
+Ordered prep playlist: matched artists with incomplete albums first, then discovery entry points.
+Set time conflicts if daily schedule available.""",
+    },
+}

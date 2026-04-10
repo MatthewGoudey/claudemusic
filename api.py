@@ -11,6 +11,7 @@ from datetime import date, timedelta
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from src.database import get_pool, get_ro_pool, close_pools, fetch, fetchrow, fetchval, fetch_ro, execute
@@ -18,6 +19,7 @@ from src.auth import verify_key
 from src.filters import parse_date_filter, DateFilter
 from src.musicbrainz import resolve_single, resolve_all_missing, get_resolution_status
 from src.schema_registry import SCHEMA
+from src.modes import MODES
 import math
 
 logger = logging.getLogger(__name__)
@@ -128,6 +130,31 @@ async def health():
 @app.get("/api/schema")
 async def schema():
     return SCHEMA
+
+
+# ============================================================
+# Modes (no auth)
+# ============================================================
+
+@app.get("/api/modes")
+async def modes_index():
+    return {
+        "modes": [
+            {"id": mode_id, "name": m["name"], "description": m["description"]}
+            for mode_id, m in MODES.items()
+        ]
+    }
+
+
+@app.get("/api/modes/{mode_id}", response_class=PlainTextResponse)
+async def mode_detail(mode_id: str):
+    if mode_id not in MODES:
+        valid = ", ".join(MODES.keys())
+        return PlainTextResponse(
+            f"Unknown mode: {mode_id}\nValid modes: {valid}",
+            status_code=404,
+        )
+    return PlainTextResponse(MODES[mode_id]["spec"])
 
 
 # ============================================================

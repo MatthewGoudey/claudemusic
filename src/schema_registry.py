@@ -21,6 +21,23 @@ SCHEMA = {
             "auth": False,
         },
         {
+            "route": "/api/modes",
+            "method": "GET",
+            "description": "Index of all exploration modes — returns id, name, and one-line description for each mode",
+            "params": {},
+            "auth": False,
+        },
+        {
+            "route": "/api/modes/{mode_id}",
+            "method": "GET",
+            "description": "Full mode specification as plain text (Content-Type: text/plain). Used by Claude as procedural instructions for music exploration workflows.",
+            "params": {
+                "mode_id": {"type": "string", "required": True, "location": "path",
+                            "enum": ["finish", "disco", "gap", "roots", "scene", "bridge", "adjacent", "mood", "cold", "revisit", "live", "festival"]},
+            },
+            "auth": False,
+        },
+        {
             "route": "/api/summary",
             "method": "GET",
             "description": "High-level stats: total listens, unique tracks/artists, platform breakdown",
