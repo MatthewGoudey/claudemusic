@@ -919,3 +919,21 @@ async def chicago_match(
         "unmatched_count": (total_upcoming or 0) - len(matches),
         "filters": {**df.as_dict(), "min_listens": min_listens},
     }
+
+
+# ============================================================
+# Admin: one-time migrations (auth required, write access)
+# ============================================================
+
+@app.post("/api/admin/migrate")
+async def admin_migrate(body: dict, _=Depends(verify_key)):
+    """Execute a DDL/admin SQL statement. For one-time migrations only."""
+    sql = body.get("sql", "").strip()
+    if not sql:
+        raise HTTPException(status_code=400, detail="Missing 'sql' field")
+
+    try:
+        result = await execute(sql)
+        return {"status": "ok", "result": str(result)}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
