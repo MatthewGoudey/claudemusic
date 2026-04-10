@@ -40,10 +40,10 @@ CREATE INDEX IF NOT EXISTS idx_chicago_shows_artist_trgm ON chicago_shows
     USING gin (LOWER(artist_name) gin_trgm_ops);
 
 CREATE OR REPLACE FUNCTION normalize_artist(name TEXT) RETURNS TEXT AS $$
-    SELECT LOWER(REGEXP_REPLACE(
+    SELECT TRIM(REGEXP_REPLACE(
         REGEXP_REPLACE(
-            REGEXP_REPLACE(name, '^\s*the\s+', '', 'i'),
-            '\s*(feat\.?|ft\.?|with|&|and)\s+.*$', '', 'i'
+            REGEXP_REPLACE(LOWER(name), '^\s*the\s+', '', ''),
+            '\s*(feat\.?|ft\.?|with|&|and)\s+.*$', '', ''
         ), '[^a-z0-9\s]', '', 'g'
     ))
 $$ LANGUAGE SQL IMMUTABLE;

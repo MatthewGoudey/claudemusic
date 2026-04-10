@@ -37,6 +37,17 @@ async def startup():
             with open(sql_path) as f:
                 await conn.execute(f.read())
             logger.info("Created chicago_shows table")
+        # Always update the normalize_artist function (fixes LOWER() ordering)
+        await conn.execute("""
+            CREATE OR REPLACE FUNCTION normalize_artist(name TEXT) RETURNS TEXT AS $$
+                SELECT TRIM(REGEXP_REPLACE(
+                    REGEXP_REPLACE(
+                        REGEXP_REPLACE(LOWER(name), '^\s*the\s+', '', ''),
+                        '\s*(feat\.?|ft\.?|with|&|and)\s+.*$', '', ''
+                    ), '[^a-z0-9\s]', '', 'g'
+                ))
+            $$ LANGUAGE SQL IMMUTABLE
+        """)
 
 
 @app.on_event("shutdown")
@@ -830,7 +841,7 @@ async def chicago_match(
         return {"matches": [], "unmatched_count": 0, "filters": df.as_dict()}
 
     # Get distinct normalized artist names from shows
-    norm_artists = list({s["norm_artist"] for s in shows if s["norm_artist"]})
+    norm_artists = list({s["norm_artist"] for s in shows if s["norm_artist"] and s["norm_artist"].strip()})
 
     if not norm_artists:
         return {"matches": [], "unmatched_count": len(shows), "filters": df.as_dict()}
