@@ -846,37 +846,61 @@ async def chicago_match(
     if not norm_artists:
         return {"matches": [], "unmatched_count": len(shows), "filters": df.as_dict()}
 
-    # Batch lookup listening stats for all show artists
-    # Build ANY array for efficient matching
+    # Single query: join shows against listen_events using normalize_artist,
+    # compute stats + top album in one pass using LATERAL + window functions
     listening_stats = await fetch("""
-        SELECT
-            normalize_artist(raw_artist) AS norm_artist,
-            raw_artist AS known_as,
-            COUNT(*) AS total_listens,
-            COUNT(DISTINCT raw_title) AS unique_tracks,
-            COUNT(DISTINCT raw_album) FILTER (WHERE raw_album IS NOT NULL) AS unique_albums,
-            MIN(listened_at) AS first_listen,
-            MAX(listened_at) AS last_listen,
-            COUNT(*) FILTER (WHERE listened_at > NOW() - INTERVAL '90 days') AS listens_90d,
-            COUNT(*) FILTER (WHERE listened_at > NOW() - INTERVAL '365 days') AS listens_365d
-        FROM listen_events
-        WHERE normalize_artist(raw_artist) = ANY($1)
-        GROUP BY norm_artist, raw_artist
+        WITH show_artists AS (
+            SELECT DISTINCT norm_artist
+            FROM unnest($1::text[]) AS norm_artist
+            WHERE norm_artist IS NOT NULL AND norm_artist != ''
+        ),
+        artist_stats AS (
+            SELECT
+                sa.norm_artist,
+                le.raw_artist AS known_as,
+                COUNT(*) AS total_listens,
+                COUNT(DISTINCT le.raw_title) AS unique_tracks,
+                COUNT(DISTINCT le.raw_album) FILTER (WHERE le.raw_album IS NOT NULL) AS unique_albums,
+                MAX(le.listened_at) AS last_listen,
+                COUNT(*) FILTER (WHERE le.listened_at > NOW() - INTERVAL '90 days') AS listens_90d,
+                COUNT(*) FILTER (WHERE le.listened_at > NOW() - INTERVAL '365 days') AS listens_365d
+            FROM show_artists sa
+            JOIN listen_events le ON LOWER(le.raw_artist) = sa.norm_artist
+                OR normalize_artist(le.raw_artist) = sa.norm_artist
+            GROUP BY sa.norm_artist, le.raw_artist
+        ),
+        best_per_artist AS (
+            SELECT DISTINCT ON (norm_artist) *
+            FROM artist_stats
+            ORDER BY norm_artist, total_listens DESC
+        ),
+        top_albums AS (
+            SELECT DISTINCT ON (bpa.norm_artist)
+                bpa.norm_artist,
+                le.raw_album
+            FROM best_per_artist bpa
+            JOIN listen_events le ON LOWER(le.raw_artist) = LOWER(bpa.known_as)
+            WHERE le.raw_album IS NOT NULL
+            GROUP BY bpa.norm_artist, le.raw_album
+            ORDER BY bpa.norm_artist, COUNT(*) DESC
+        )
+        SELECT bpa.*, ta.raw_album AS top_album
+        FROM best_per_artist bpa
+        LEFT JOIN top_albums ta ON ta.norm_artist = bpa.norm_artist
     """, norm_artists)
 
-    # Build lookup: norm_artist -> best stats row (highest listen count)
+    # Build lookup: norm_artist -> stats
     stats_map: dict[str, dict] = {}
     for row in listening_stats:
-        na = row["norm_artist"]
-        if na not in stats_map or row["total_listens"] > stats_map[na]["total_listens"]:
-            stats_map[na] = row
+        stats_map[row["norm_artist"]] = row
 
     # Score and rank matches
     matches = []
     unmatched = 0
 
     for show in shows:
-        stats = stats_map.get(show["norm_artist"])
+        na = show["norm_artist"]
+        stats = stats_map.get(na)
         if not stats or stats["total_listens"] < min_listens:
             unmatched += 1
             continue
@@ -892,17 +916,6 @@ async def chicago_match(
             recency = 2.0
         score = round(math.log(total + 1) * track_factor * recency, 1)
 
-        # Get top album for context
-        top_album = await fetchrow("""
-            SELECT raw_album, COUNT(*) AS cnt
-            FROM listen_events
-            WHERE normalize_artist(raw_artist) = $1 AND raw_album IS NOT NULL
-            GROUP BY raw_album
-            ORDER BY cnt DESC
-            LIMIT 1
-        """, show["norm_artist"])
-
-        # Remove the norm_artist working field from show output
         show_out = {k: v for k, v in show.items() if k != "norm_artist"}
 
         matches.append({
@@ -912,7 +925,7 @@ async def chicago_match(
                 "unique_tracks": stats["unique_tracks"],
                 "unique_albums": stats["unique_albums"],
                 "last_listen": stats["last_listen"].isoformat() if stats["last_listen"] else None,
-                "top_album": top_album["raw_album"] if top_album else None,
+                "top_album": stats.get("top_album"),
             },
             "relevance_score": score,
         })
