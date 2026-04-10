@@ -46,6 +46,11 @@ async def startup():
         if os.path.exists(venues_sql):
             with open(venues_sql) as f:
                 await conn.execute(f.read())
+        # Ensure show_interests table exists
+        interests_sql = os.path.join(os.path.dirname(__file__), "sql", "show_interests.sql")
+        if os.path.exists(interests_sql):
+            with open(interests_sql) as f:
+                await conn.execute(f.read())
         # Always update the normalize_artist function (fixes LOWER() ordering)
         await conn.execute("""
             CREATE OR REPLACE FUNCTION normalize_artist(name TEXT) RETURNS TEXT AS $$
@@ -787,9 +792,11 @@ async def chicago_shows(
                cs.doors_time, cs.support_acts, cs.ticket_url, cs.ticket_price, cs.age_restriction,
                cs.sources, cs.presale_name, cs.presale_start, cs.presale_end, cs.onsale_date,
                cs.festival_name, cs.status, cs.first_seen, cs.last_verified,
-               v.travel_driving_min, v.travel_transit_min, v.travel_best_min
+               v.travel_driving_min, v.travel_transit_min, v.travel_best_min,
+               si.status AS interest_status, si.note AS interest_note
         FROM chicago_shows cs
         LEFT JOIN venues v ON LOWER(v.venue_name) = LOWER(cs.venue_name)
+        LEFT JOIN show_interests si ON si.show_id = cs.show_id
         {genre_join}
         {where}
         ORDER BY cs.show_date ASC, cs.show_time ASC NULLS LAST
@@ -819,9 +826,11 @@ async def chicago_presales(
         SELECT cs.show_id, cs.artist_name, cs.venue_name, cs.show_date, cs.show_time,
                cs.ticket_url, cs.ticket_price, cs.presale_name, cs.presale_start, cs.presale_end,
                cs.onsale_date, cs.sources, cs.festival_name, cs.first_seen,
-               v.travel_driving_min, v.travel_transit_min, v.travel_best_min
+               v.travel_driving_min, v.travel_transit_min, v.travel_best_min,
+               si.status AS interest_status, si.note AS interest_note
         FROM chicago_shows cs
         LEFT JOIN venues v ON LOWER(v.venue_name) = LOWER(cs.venue_name)
+        LEFT JOIN show_interests si ON si.show_id = cs.show_id
         WHERE cs.presale_start IS NOT NULL
           AND cs.presale_start > NOW() - INTERVAL '1 day'
           AND cs.presale_start < NOW() + MAKE_INTERVAL(days => $1)
@@ -852,9 +861,11 @@ async def chicago_just_announced(
     rows = await fetch("""
         SELECT cs.show_id, cs.artist_name, cs.venue_name, cs.show_date, cs.show_time,
                cs.ticket_url, cs.ticket_price, cs.sources, cs.festival_name, cs.first_seen, cs.status,
-               v.travel_driving_min, v.travel_transit_min, v.travel_best_min
+               v.travel_driving_min, v.travel_transit_min, v.travel_best_min,
+               si.status AS interest_status, si.note AS interest_note
         FROM chicago_shows cs
         LEFT JOIN venues v ON LOWER(v.venue_name) = LOWER(cs.venue_name)
+        LEFT JOIN show_interests si ON si.show_id = cs.show_id
         WHERE cs.first_seen > NOW() - MAKE_INTERVAL(days => $1)
           AND cs.show_date >= CURRENT_DATE
         ORDER BY cs.first_seen DESC
@@ -947,11 +958,13 @@ async def chicago_match(
                als.total_listens, als.unique_tracks, als.unique_albums,
                als.last_listen, als.listens_90d, als.listens_365d, als.top_album,
                v.travel_driving_min, v.travel_transit_min, v.travel_best_min,
-               tr.tmin AS travel_min_all, tr.tmax AS travel_max_all
+               tr.tmin AS travel_min_all, tr.tmax AS travel_max_all,
+               si.status AS interest_status, si.note AS interest_note
         FROM upcoming u
         JOIN artist_listen_stats als ON als.norm_artist = u.norm_artist
             AND als.norm_artist != ''
         LEFT JOIN venues v ON LOWER(v.venue_name) = LOWER(u.venue_name)
+        LEFT JOIN show_interests si ON si.show_id = u.show_id
         CROSS JOIN travel_range tr
         WHERE als.total_listens >= ${min_idx}
         ORDER BY
@@ -1003,6 +1016,8 @@ async def chicago_match(
                 "last_listen": row["last_listen"].isoformat() if row["last_listen"] else None,
                 "top_album": row["top_album"],
             },
+            "interest_status": row.get("interest_status"),
+            "interest_note": row.get("interest_note"),
             "relevance_score": score,
         })
 
@@ -1016,6 +1031,95 @@ async def chicago_match(
         "unmatched_count": (total_upcoming or 0) - len(matches),
         "filters": {**df.as_dict(), "min_listens": min_listens, "genre": genre, "festival": festival},
     }
+
+
+# ============================================================
+# Show interest tracking
+# ============================================================
+
+
+class InterestRequest(BaseModel):
+    show_id: int
+    status: str  # going, interested, not_interested, cant_afford
+    note: Optional[str] = None
+
+
+@app.put("/api/chicago-shows/interest")
+async def set_interest(req: InterestRequest, _=Depends(verify_key)):
+    valid = ("going", "interested", "not_interested", "cant_afford")
+    if req.status not in valid:
+        raise HTTPException(400, f"status must be one of: {', '.join(valid)}")
+
+    row = await fetchrow("""
+        INSERT INTO show_interests (show_id, status, note)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (show_id) DO UPDATE SET
+            status = EXCLUDED.status,
+            note = EXCLUDED.note,
+            updated_at = NOW()
+        RETURNING interest_id, show_id, status, note, created_at, updated_at
+    """, req.show_id, req.status, req.note)
+
+    if not row:
+        raise HTTPException(404, "show_id not found")
+
+    return row
+
+
+@app.delete("/api/chicago-shows/interest/{show_id}")
+async def delete_interest(show_id: int, _=Depends(verify_key)):
+    result = await execute("""
+        DELETE FROM show_interests WHERE show_id = $1
+    """, show_id)
+
+    if result == "DELETE 0":
+        raise HTTPException(404, "No interest tracked for this show")
+
+    return {"deleted": True, "show_id": show_id}
+
+
+@app.get("/api/chicago-shows/interest")
+async def list_interests(
+    status: Optional[str] = None,
+    limit: int = Query(default=50, le=1000),
+    _=Depends(verify_key),
+):
+    clauses = ["cs.show_date >= CURRENT_DATE"]
+    params = []
+
+    if status:
+        params.append(status)
+        clauses.append(f"si.status = ${len(params)}")
+
+    where = "WHERE " + " AND ".join(clauses)
+    params.append(limit)
+    limit_idx = len(params)
+
+    rows = await fetch(f"""
+        SELECT cs.show_id, cs.artist_name, cs.venue_name, cs.show_date, cs.show_time,
+               cs.doors_time, cs.ticket_url, cs.ticket_price, cs.festival_name,
+               cs.status AS show_status,
+               si.status AS interest_status, si.note, si.created_at AS tracked_at, si.updated_at,
+               v.travel_driving_min, v.travel_transit_min, v.travel_best_min
+        FROM show_interests si
+        JOIN chicago_shows cs ON cs.show_id = si.show_id
+        LEFT JOIN venues v ON LOWER(v.venue_name) = LOWER(cs.venue_name)
+        {where}
+        ORDER BY cs.show_date ASC
+        LIMIT ${limit_idx}
+    """, *params)
+
+    results = []
+    for row in rows:
+        r = dict(row)
+        r["travel"] = {
+            "driving_min": r.pop("travel_driving_min", None),
+            "transit_min": r.pop("travel_transit_min", None),
+            "best_min": r.pop("travel_best_min", None),
+        }
+        results.append(r)
+
+    return {"interests": results, "count": len(results), "filters": {"status": status}}
 
 
 # ============================================================

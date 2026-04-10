@@ -233,5 +233,32 @@ SCHEMA = {
             },
             "auth": True,
         },
+        {
+            "route": "/api/chicago-shows/interest",
+            "method": "PUT",
+            "description": "Set or update interest status for a show. Upserts — call again to change your mind.",
+            "body": {
+                "show_id": {"type": "int", "required": True, "description": "The show_id from chicago_shows"},
+                "status": {"type": "string", "required": True, "enum": ["going", "interested", "not_interested", "cant_afford"]},
+                "note": {"type": "string", "required": False, "description": "Free-text note (e.g. 'too expensive', 'love their new album')"},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/chicago-shows/interest",
+            "method": "GET",
+            "description": "List all shows you've tracked interest in. Includes full show data and travel times.",
+            "params": {
+                "status": {"type": "string", "required": False, "description": "Filter by interest status", "enum": ["going", "interested", "not_interested", "cant_afford"]},
+                "limit": {"type": "int", "required": False, "default": 50, "max": 1000},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/chicago-shows/interest/{show_id}",
+            "method": "DELETE",
+            "description": "Remove interest tracking for a show.",
+            "auth": True,
+        },
     ]
 }
