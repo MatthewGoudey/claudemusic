@@ -769,8 +769,8 @@ async def chicago_shows(
 
     if festival:
         idx = len(params) + 1
-        clauses.append(f"LOWER(cs.festival_name) = LOWER(${idx})")
-        params.append(festival)
+        clauses.append(f"LOWER(cs.festival_name) LIKE LOWER(${idx})")
+        params.append(f"%{festival}%")
 
     genre_join = ""
     if genre:
@@ -845,6 +845,7 @@ async def chicago_match(
     days: Optional[int] = None,
     min_listens: int = Query(default=1),
     genre: Optional[str] = None,
+    festival: Optional[str] = None,
     limit: int = Query(default=50, le=1000),
     _=Depends(verify_key),
 ):
@@ -872,6 +873,13 @@ async def chicago_match(
     if genre:
         params.append(f"%{genre}%")
         genre_join = f"JOIN artist_tags gt ON gt.norm_artist = normalize_artist(cs.artist_name) AND LOWER(gt.tag) LIKE LOWER(${len(params)})"
+
+    if festival:
+        params.append(f"%{festival}%")
+        clauses.append(f"LOWER(cs.festival_name) LIKE LOWER(${len(params)})")
+
+    # Track params needed for the WHERE clause (for unmatched count query)
+    where_param_count = len(params)
 
     params.append(min_listens)
     min_idx = len(params)
@@ -962,15 +970,15 @@ async def chicago_match(
             "relevance_score": score,
         })
 
-    # Unmatched count — only needs the date/status params (first 2)
+    # Unmatched count — needs all WHERE params (dates + optional festival)
     total_upcoming = await fetchval(f"""
         SELECT COUNT(*) FROM chicago_shows cs {where}
-    """, *params[:2])
+    """, *params[:where_param_count])
 
     return {
         "matches": matches,
         "unmatched_count": (total_upcoming or 0) - len(matches),
-        "filters": {**df.as_dict(), "min_listens": min_listens, "genre": genre},
+        "filters": {**df.as_dict(), "min_listens": min_listens, "genre": genre, "festival": festival},
     }
 
 
