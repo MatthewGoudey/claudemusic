@@ -909,10 +909,10 @@ async def chicago_match(
             "relevance_score": score,
         })
 
-    # Unmatched count
+    # Unmatched count — only needs the date/status params (first 2)
     total_upcoming = await fetchval(f"""
         SELECT COUNT(*) FROM chicago_shows cs {where}
-    """, *params[:len(clauses)])
+    """, *params[:2])
 
     return {
         "matches": matches,
