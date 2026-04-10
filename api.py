@@ -31,8 +31,8 @@ async def startup():
     # Ensure chicago_shows table exists
     async with pool.acquire() as conn:
         exists = await conn.fetchval("SELECT to_regclass('public.chicago_shows')")
+        import os
         if exists is None:
-            import os
             sql_path = os.path.join(os.path.dirname(__file__), "sql", "chicago_shows.sql")
             with open(sql_path) as f:
                 await conn.execute(f.read())
