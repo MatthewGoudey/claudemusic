@@ -922,6 +922,148 @@ async def chicago_match(
 
 
 # ============================================================
+# Discover: similar artists with events
+# ============================================================
+
+@app.get("/api/discover")
+async def discover(
+    seed: str = Query(..., description="Seed artist name"),
+    include_events: bool = Query(default=True),
+    max_similar: int = Query(default=20, le=100),
+    exclude_heard: bool = Query(default=False),
+    _=Depends(verify_key),
+):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Normalize seed
+        norm_seed = await conn.fetchval("SELECT normalize_artist($1)", seed)
+        if not norm_seed or not norm_seed.strip():
+            raise HTTPException(status_code=400, detail=f"Could not normalize artist name: {seed}")
+
+        # Seed artist stats
+        seed_stats = await conn.fetchrow("""
+            SELECT total_listens, unique_tracks, unique_albums, last_listen, top_album
+            FROM artist_listen_stats WHERE norm_artist = $1
+        """, norm_seed)
+
+        # Similar artists with listen stats and tags
+        similar_rows = await conn.fetch("""
+            SELECT
+                s.norm_artist_b,
+                s.score AS similarity_score,
+                s.source,
+                als.raw_artist,
+                als.total_listens,
+                als.unique_tracks,
+                als.last_listen
+            FROM artist_similarity s
+            LEFT JOIN artist_listen_stats als ON als.norm_artist = s.norm_artist_b
+            WHERE s.norm_artist_a = $1
+            ORDER BY s.score DESC
+            LIMIT $2
+        """, norm_seed, max_similar)
+
+        # Build result list
+        similar_norms = []
+        similar_artists = []
+        for row in similar_rows:
+            listen_count = row["total_listens"] or 0
+            heard = listen_count > 0
+
+            if exclude_heard and heard:
+                continue
+
+            norm_b = row["norm_artist_b"]
+            similar_norms.append(norm_b)
+
+            # Use raw_artist from stats if available, otherwise titlecase the norm
+            display_name = row["raw_artist"] or norm_b.title()
+
+            similar_artists.append({
+                "name": display_name,
+                "norm_artist": norm_b,
+                "similarity_score": row["similarity_score"],
+                "source": row["source"],
+                "heard_before": heard,
+                "listen_count": listen_count,
+                "tags": [],
+                "upcoming_shows": [],
+            })
+
+        # Fetch tags for all similar artists in one query
+        if similar_norms:
+            tag_rows = await conn.fetch("""
+                SELECT norm_artist, tag, weight
+                FROM artist_tags
+                WHERE norm_artist = ANY($1)
+                ORDER BY norm_artist, weight DESC
+            """, similar_norms)
+
+            tag_map: dict[str, list[str]] = {}
+            for tr in tag_rows:
+                tag_map.setdefault(tr["norm_artist"], []).append(tr["tag"])
+
+            for artist in similar_artists:
+                artist["tags"] = tag_map.get(artist["norm_artist"], [])
+
+        # Fetch upcoming shows for similar artists + seed
+        if include_events and similar_norms:
+            all_norms = [norm_seed] + similar_norms
+            show_rows = await conn.fetch("""
+                SELECT
+                    normalize_artist(cs.artist_name) AS norm_artist,
+                    cs.show_id, cs.artist_name, cs.venue_name, cs.show_date,
+                    cs.show_time, cs.ticket_url, cs.status
+                FROM chicago_shows cs
+                WHERE normalize_artist(cs.artist_name) = ANY($1)
+                  AND cs.show_date >= CURRENT_DATE
+                  AND cs.status = 'upcoming'
+                ORDER BY cs.show_date ASC
+            """, all_norms)
+
+            show_map: dict[str, list[dict]] = {}
+            for sr in show_rows:
+                show_map.setdefault(sr["norm_artist"], []).append({
+                    "show_id": sr["show_id"],
+                    "artist_name": sr["artist_name"],
+                    "venue_name": sr["venue_name"],
+                    "date": sr["show_date"].isoformat() if sr["show_date"] else None,
+                    "time": sr["show_time"].isoformat() if sr["show_time"] else None,
+                    "ticket_url": sr["ticket_url"],
+                })
+
+            for artist in similar_artists:
+                artist["upcoming_shows"] = show_map.get(artist["norm_artist"], [])
+
+            seed_shows = show_map.get(norm_seed, [])
+        else:
+            seed_shows = []
+
+        # Clean norm_artist from output
+        for artist in similar_artists:
+            del artist["norm_artist"]
+
+    return {
+        "seed_artist": seed,
+        "seed_norm": norm_seed,
+        "seed_stats": {
+            "total_listens": seed_stats["total_listens"] if seed_stats else 0,
+            "unique_tracks": seed_stats["unique_tracks"] if seed_stats else 0,
+            "unique_albums": seed_stats["unique_albums"] if seed_stats else 0,
+            "last_listen": seed_stats["last_listen"].isoformat() if seed_stats and seed_stats["last_listen"] else None,
+            "top_album": seed_stats["top_album"] if seed_stats else None,
+        },
+        "seed_upcoming_shows": seed_shows,
+        "similar_artists": similar_artists,
+        "filters": {
+            "max_similar": max_similar,
+            "exclude_heard": exclude_heard,
+            "include_events": include_events,
+        },
+    }
+
+
+# ============================================================
 # Admin: one-time migrations (auth required, write access)
 # ============================================================
 

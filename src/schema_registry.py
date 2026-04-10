@@ -216,5 +216,17 @@ SCHEMA = {
             },
             "auth": True,
         },
+        {
+            "route": "/api/discover",
+            "method": "GET",
+            "description": "Discover similar artists to a seed artist. Returns similarity scores, listening stats, genre tags, and upcoming Chicago shows. Powered by ListenBrainz similarity + Last.fm tags.",
+            "params": {
+                "seed": {"type": "string", "required": True, "description": "Seed artist name"},
+                "include_events": {"type": "bool", "required": False, "default": True, "description": "Include upcoming Chicago shows for similar artists"},
+                "max_similar": {"type": "int", "required": False, "default": 20, "max": 100},
+                "exclude_heard": {"type": "bool", "required": False, "default": False, "description": "Filter out artists you've already listened to"},
+            },
+            "auth": True,
+        },
     ]
 }
