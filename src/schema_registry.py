@@ -295,5 +295,51 @@ SCHEMA = {
             "description": "Remove interest tracking for a show.",
             "auth": True,
         },
+        {
+            "route": "/api/canonical",
+            "method": "POST",
+            "description": "Upsert canonical albums. Batch support — send multiple albums per request. ON CONFLICT updates existing entries.",
+            "body": {
+                "albums": [{"artist": "string", "album": "string", "year": "int (optional)",
+                            "genre": "string", "subgenre": "string (optional)",
+                            "tier": "essential|important|deep (default: essential)",
+                            "description": "string (optional)"}],
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/canonical",
+            "method": "GET",
+            "description": "List canonical albums. Default compact format returns one album per line with genre, tier, and description.",
+            "params": {
+                "genre": {"type": "string", "required": False, "description": "Filter by genre (case-insensitive)"},
+                "subgenre": {"type": "string", "required": False, "description": "Filter by subgenre (case-insensitive)"},
+                "tier": {"type": "string", "required": False, "enum": ["essential", "important", "deep"]},
+                "artist": {"type": "string", "required": False, "description": "Fuzzy match artist name"},
+                "limit": {"type": "int", "required": False, "default": 50, "max": 1000},
+                "offset": {"type": "int", "required": False, "default": 0},
+                "format": {"type": "string", "required": False, "default": "compact", "enum": ["compact", "json"]},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/canonical/{album_id}",
+            "method": "DELETE",
+            "description": "Delete a canonical album by ID.",
+            "params": {
+                "album_id": {"type": "int", "required": True, "location": "path"},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/canonical",
+            "method": "DELETE",
+            "description": "Delete a canonical album by artist + album name match (case-insensitive).",
+            "params": {
+                "artist": {"type": "string", "required": True},
+                "album": {"type": "string", "required": True},
+            },
+            "auth": True,
+        },
     ]
 }

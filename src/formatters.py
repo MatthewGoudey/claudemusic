@@ -181,3 +181,21 @@ def compact_chicago_shows(shows: list[dict]) -> str:
         time_part = f" | {time_str}" if time_str else ""
         lines.append(f"{day_date} | {artist} @ {venue}{time_part}{price_str}")
     return "\n".join(lines)
+
+
+def compact_canonical(rows: list[dict]) -> str:
+    """'Artist - Album (year) [genre/subgenre] tier — description' one per line."""
+    lines = []
+    for r in rows:
+        artist = r.get("artist", "?")
+        album = r.get("album", "?")
+        year = r.get("year")
+        year_str = f" ({year})" if year else ""
+        genre = r.get("genre", "")
+        subgenre = r.get("subgenre")
+        genre_str = f"{genre}/{subgenre}" if subgenre else genre
+        tier = r.get("tier", "")
+        desc = r.get("description", "")
+        desc_str = f" — {desc}" if desc else ""
+        lines.append(f"{artist} - {album}{year_str} [{genre_str}] {tier}{desc_str}")
+    return "\n".join(lines)

@@ -23,7 +23,7 @@ from src.modes import MODES
 from src.formatters import (
     compact_top_artists, compact_top_tracks, compact_top_albums,
     compact_recent, compact_album_completion, compact_chicago_shows_match,
-    compact_discover, compact_chicago_shows, _fmt_ts,
+    compact_discover, compact_chicago_shows, compact_canonical, _fmt_ts,
 )
 import math
 
@@ -57,6 +57,11 @@ async def startup():
         interests_sql = os.path.join(os.path.dirname(__file__), "sql", "show_interests.sql")
         if os.path.exists(interests_sql):
             with open(interests_sql) as f:
+                await conn.execute(f.read())
+        # Ensure canonical_albums table exists
+        canonical_sql = os.path.join(os.path.dirname(__file__), "sql", "canonical_albums.sql")
+        if os.path.exists(canonical_sql):
+            with open(canonical_sql) as f:
                 await conn.execute(f.read())
         # Always update the normalize_artist function (fixes LOWER() ordering)
         await conn.execute("""
@@ -1506,6 +1511,118 @@ async def discover(
     if format == "compact":
         return PlainTextResponse(compact_discover(result))
     return result
+
+
+# ============================================================
+# Canonical albums
+# ============================================================
+
+
+class CanonicalAlbumEntry(BaseModel):
+    artist: str
+    album: str
+    year: Optional[int] = None
+    genre: str
+    subgenre: Optional[str] = None
+    tier: str = "essential"
+    description: Optional[str] = None
+
+
+class CanonicalBatchRequest(BaseModel):
+    albums: list[CanonicalAlbumEntry]
+
+
+@app.post("/api/canonical")
+async def upsert_canonical(body: CanonicalBatchRequest, _=Depends(verify_key)):
+    valid_tiers = ("essential", "important", "deep")
+    for entry in body.albums:
+        if entry.tier not in valid_tiers:
+            raise HTTPException(400, f"tier must be one of: {', '.join(valid_tiers)}")
+
+    count = 0
+    for entry in body.albums:
+        await execute("""
+            INSERT INTO canonical_albums (artist, album, year, genre, subgenre, tier, description)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (artist, album) DO UPDATE SET
+                year = EXCLUDED.year,
+                genre = EXCLUDED.genre,
+                subgenre = EXCLUDED.subgenre,
+                tier = EXCLUDED.tier,
+                description = EXCLUDED.description
+        """, entry.artist, entry.album, entry.year, entry.genre,
+            entry.subgenre, entry.tier, entry.description)
+        count += 1
+
+    return {"upserted": count}
+
+
+@app.get("/api/canonical")
+async def list_canonical(
+    genre: Optional[str] = None,
+    subgenre: Optional[str] = None,
+    tier: Optional[str] = None,
+    artist: Optional[str] = None,
+    limit: int = Query(default=50, le=1000),
+    offset: int = Query(default=0, ge=0),
+    format: str = Query(default="compact", pattern="^(compact|json)$"),
+    _=Depends(verify_key),
+):
+    clauses = []
+    params = []
+
+    if genre:
+        params.append(genre)
+        clauses.append(f"LOWER(genre) = LOWER(${len(params)})")
+    if subgenre:
+        params.append(subgenre)
+        clauses.append(f"LOWER(subgenre) = LOWER(${len(params)})")
+    if tier:
+        params.append(tier)
+        clauses.append(f"tier = ${len(params)}")
+    if artist:
+        params.append(f"%{artist}%")
+        clauses.append(f"LOWER(artist) LIKE LOWER(${len(params)})")
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.extend([limit, offset])
+    limit_idx = len(params) - 1
+    offset_idx = len(params)
+
+    rows = await fetch(f"""
+        SELECT id, artist, album, year, genre, subgenre, tier, description, added_at
+        FROM canonical_albums
+        {where}
+        ORDER BY genre, tier, year NULLS LAST
+        LIMIT ${limit_idx} OFFSET ${offset_idx}
+    """, *params)
+
+    if format == "compact":
+        return PlainTextResponse(compact_canonical(rows))
+    return {"albums": rows, "count": len(rows), "filters": {"genre": genre, "subgenre": subgenre, "tier": tier, "artist": artist}}
+
+
+@app.delete("/api/canonical/{album_id}")
+async def delete_canonical(album_id: int, _=Depends(verify_key)):
+    result = await execute("DELETE FROM canonical_albums WHERE id = $1", album_id)
+    if result == "DELETE 0":
+        raise HTTPException(404, "Album not found")
+    return {"deleted": True, "id": album_id}
+
+
+@app.delete("/api/canonical")
+async def delete_canonical_by_match(
+    artist: str = Query(...),
+    album: str = Query(...),
+    _=Depends(verify_key),
+):
+    result = await execute(
+        "DELETE FROM canonical_albums WHERE LOWER(artist) = LOWER($1) AND LOWER(album) = LOWER($2)",
+        artist, album,
+    )
+    if result == "DELETE 0":
+        raise HTTPException(404, f"No canonical album found: {artist} - {album}")
+    return {"deleted": True, "artist": artist, "album": album}
 
 
 # ============================================================

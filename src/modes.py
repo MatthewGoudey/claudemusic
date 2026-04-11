@@ -54,15 +54,10 @@ Mode: gap_fill
 
 Address known canonical gaps — foundational albums the user knows they're missing.
 
-Known gaps:
-- lo-fi/slacker rock: Sebadoh, Liz Phair (Exile in Guyville), Pavement (Slanted and Enchanted deep listen — only 9 plays)
-- alt-rock: Pre-1991 formation layer, Sonic Youth, shoegaze crossover
-- alt-country: No Depression core — Uncle Tupelo, early Wilco, Whiskeytown, Drive-By Truckers
-- corridos tumbados: Traditional corrido foundation beyond Chalino and Los Tigres
-- country-punk: Beyond Clash/Pogues/Amigo the Devil — Mekons, X, Jason and the Scorchers, Hank III
-
 API Action:
-Confirm the gap still exists by querying the specific artist/album. If they've since listened, update and pick the next gap.
+1. /api/canonical to pull the canonical albums list. Filter by genre or tier as needed.
+2. Cross-reference each canonical album against /api/artist/{name} or /api/album-completion?artist=[name] to check if the user has listened.
+3. Albums with zero or near-zero plays are confirmed gaps. Pick the highest-tier unheard album.
 
 Source Action:
 Search the genre-specific publication (No Depression for alt-country, BrooklynVegan for punk crossover, etc.) for "essential" or "canon" lists.
@@ -86,6 +81,7 @@ Go backward from a genre the user loves to its foundational layer. Work forward 
 API Action:
 Identify which era of a genre the user is heaviest in (e.g., 2000s alt-rock revival, modern outlaw country).
 Query play counts for artists from earlier eras of the same genre to quantify the historical gap.
+/api/canonical?genre=[genre] to find canonical root albums the user hasn't heard yet.
 
 Source Action (uses the most sources):
 1. Rolling Stone or Acclaimed Music genre retrospectives for canonical historical sequence
@@ -161,8 +157,9 @@ Mode: adjacent_genre
 Identify unexplored genres that border genres the user is deep in, and provide an entry point.
 
 API Action:
-Pull top-artists to identify 5 strongest genres.
-Cross-reference the 42-genre guide to find genres with zero or near-zero plays that share sonic DNA.
+Pull top-artists to identify 5 strongest genres via Last.fm tags.
+/api/canonical to check which genres already have canonical entries — target genres with none.
+Cross-reference to find genres with zero or near-zero plays that share sonic DNA.
 
 Source Action:
 Search Every Noise at Once or RYM genre map for adjacency relationships.
@@ -291,6 +288,7 @@ Group by weekend first, then significant weekday shows.
 
 Output per show:
 Day of week, date, venue, artist(s), time, ticket link.
+Travel: always include venue distance — driving and transit minutes from the match response's travel object. Format as "~Xmin drive / ~Ymin transit". Helps gauge whether a weekday show is feasible or if the commute makes it a pass. If travel data is missing, note "distance unknown".
 Relevance context: listen count, top albums, last listen date.
 Prep recommendation: specific album to listen to before the show.
 Multi-artist bills: note which artists user knows vs doesn't.
@@ -324,6 +322,7 @@ Lollapalooza (late Jul/Aug), Riot Fest (mid-Sept), ARC (early Sept), Sueños (Ma
 
 Output:
 Matched artists by relevance score with listen counts and top albums.
+Travel: include venue distance — driving and transit minutes from the match response's travel object. Format as "~Xmin drive / ~Ymin transit". Helps gauge whether a weekday show is feasible or if the commute makes it a pass.
 5-10 discovery picks via /api/discover with genre context and one prep album each.
 Overall score: "X artists you already love, Y started exploring, Z discovery candidates."
 Ordered prep playlist: matched artists with incomplete albums first, then discovery entry points.
