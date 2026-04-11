@@ -339,8 +339,8 @@ HARD RULES — read these first, they override everything below:
 1. Do NOT call any listening history endpoints. No /api/top-artists, /api/top-albums, \
 /api/recent, /api/artist/, /api/summary, /api/session-start, or /api/album-completion. \
 The user's listening data is IRRELEVANT to building a canon. The only API calls you \
-make are GET /api/canonical/gaps (to check what's already in the table) and \
-POST /api/canonical (to write the results).
+make are GET /api/canonical?genre={genre}&format=json&limit=1000 (to check what's already \
+in the table for this genre), and POST /api/canonical (to write the results).
 2. Do NOT create React components, artifacts, interactive UIs, tables, or any visual \
 rendering. No artifacts of any kind. Your output is plain text and API calls. Nothing else.
 3. Do NOT ask the user for approval, confirmation, or input. This mode is fully \
@@ -352,9 +352,13 @@ not giving a listening recommendation.
 
 Workflow:
 1. User specifies a genre (and optionally subgenre).
-2. Check what's already in the table: GET /api/canonical/gaps?genre={genre}
-   - If populated: note what exists, avoid duplicates.
-   - If empty: start fresh.
+2. BEFORE building any list, query what already exists: GET /api/canonical?genre={genre}&format=json&limit=1000
+   - Parse the full response. Build a set of (artist, album) pairs that are already in the table.
+   - Do NOT add any album to your list that already exists in this set. This is how you prevent \
+duplicates when re-running a genre.
+   - If the genre has existing entries, you are ADDING to the canon, not replacing it. Only \
+include NEW albums that are not already present.
+   - If the genre is empty, start fresh.
 3. From your own knowledge of critical consensus (RYM, AOTY, Pitchfork, Rolling Stone, \
 genre-specific histories, Quietus, Bandcamp Daily), build the canon in three tiers:
    - Essential: Consensus classics. Roughly 10-20 albums.
