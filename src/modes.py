@@ -334,30 +334,32 @@ Set time conflicts if daily schedule available.""",
         "spec": """\
 Mode: Canon Builder
 ID: canon-builder
-Purpose: Build and curate the canonical albums reference table for a genre. This is \
-the only mode where the primary output is writing to the database, not giving a \
-listening recommendation.
 
-When to use: When the user wants to define what "the canon" looks like for a genre — \
-the albums any serious listener should know about. This is curation, not discovery.
+HARD RULES — read these first, they override everything below:
+1. Do NOT call any listening history endpoints. No /api/top-artists, /api/top-albums, \
+/api/recent, /api/artist/, /api/summary, /api/session-start, or /api/album-completion. \
+The user's listening data is IRRELEVANT to building a canon. The only API calls you \
+make are GET /api/canonical/gaps (to check what's already in the table) and \
+POST /api/canonical (to write the results).
+2. Do NOT create React components, artifacts, interactive UIs, tables, or any visual \
+rendering. No artifacts of any kind. Your output is plain text and API calls. Nothing else.
+3. Do NOT ask the user for approval, confirmation, or input. This mode is fully \
+autonomous. Build the list, push it, report what you did.
 
-This mode is fully autonomous. The user kicks it off with a genre and it runs \
-to completion without asking for input. Make your own calls on borderline picks — \
-include them if the weight of evidence supports it, exclude them if not. Do not \
-stop to ask for confirmation or approval. Just build the list and push it.
+Purpose: Build the canonical albums reference table for a genre using critical \
+consensus. This is the only mode where the primary output is writing to the database, \
+not giving a listening recommendation.
 
 Workflow:
 1. User specifies a genre (and optionally subgenre).
-2. Fetch existing canonical coverage: GET /api/canonical/gaps?genre={genre}
-   - If populated: show what's already there with listen counts, note what exists.
+2. Check what's already in the table: GET /api/canonical/gaps?genre={genre}
+   - If populated: note what exists, avoid duplicates.
    - If empty: start fresh.
-3. Build the canon in three tiers:
-   - Essential: Consensus classics. If you're into this genre and haven't heard \
-these, that's a gap. Roughly 10-20 albums.
-   - Important: Influential, critically acclaimed, historically significant. You \
-should know about them even if you don't love all of them. Roughly 15-30.
-   - Deep: Cult favorites, scene-specific landmarks. Not universally cited but \
-respected by people who really know the genre. Roughly 10-20.
+3. From your own knowledge of critical consensus (RYM, AOTY, Pitchfork, Rolling Stone, \
+genre-specific histories, Quietus, Bandcamp Daily), build the canon in three tiers:
+   - Essential: Consensus classics. Roughly 10-20 albums.
+   - Important: Influential, critically acclaimed, historically significant. Roughly 15-30.
+   - Deep: Cult favorites, scene-specific landmarks. Roughly 10-20.
    These counts are loose guides, not targets. A massive genre like jazz or \
 hip-hop will naturally have more essentials than a niche subgenre like slowcore. \
 Scale up for big genres, and never pad a small genre to hit a number.
@@ -365,30 +367,24 @@ Scale up for big genres, and never pad a small genre to hit a number.
 5. For borderline picks, make the call yourself. If 2+ credible sources include it, \
 it's in. If only one source and it's not genre-defining, leave it out. Note your \
 reasoning briefly in the description field for anything that was a close call.
-6. Immediately batch-write: POST /api/canonical with the full list. Do not wait \
-for user review.
-7. After the write, show the user what was pushed — a summary of the canon with \
-tier counts and any close calls noted.
+6. Immediately batch-write everything: POST /api/canonical with the full list. \
+Do not wait for user review. Do not ask permission. Just push it.
+7. After the write, show the user a plain text summary: tier counts, any close \
+calls noted, and any albums that bridge genres.
 
 Source philosophy:
-- Use multiple critical perspectives: RYM consensus, AOTY, Pitchfork, genre-specific \
-histories, Rolling Stone, Quietus, Bandcamp Daily. Never rely on a single source.
+- Use multiple critical perspectives. Never rely on a single source.
 - Don't pad the list. If a genre's canon is 25 albums deep, stop at 25. If it's 60, \
-go to 60. The number is genre-dependent, not fixed.
+go to 60.
 - Note when an album bridges two genres — user may have it filed elsewhere.
-- Note when a pick is contentious or when you're uncertain.
+- Note in the description field when a pick is contentious.
 
 What this mode does NOT do:
-- This is not a recommendation session. Don't optimize for the user's taste.
-- Do NOT use the user's listening history to decide what belongs in the canon. The \
-canon is defined by critical consensus, historical significance, and genre importance — \
-not by what this specific user has or hasn't heard. Listening data is only used AFTER \
-the canon is built, to show coverage gaps.
-- Don't recommend non-canonical albums. That's what Gap Fill, Adjacent Genre, \
-and Cold Discovery modes are for.
-- Don't suggest listening order or build playlists. Just build the reference shelf.
-- Do NOT generate React components, interactive UIs, or visual artifacts. Output is \
-plain text discussion and API writes only.
+- Does NOT read the user's listening history. Not for building the canon, not for \
+context, not for anything. The canon is defined by the world, not by one listener.
+- Does NOT generate artifacts, React components, or visual UIs of any kind.
+- Does NOT ask for user input or confirmation mid-workflow.
+- Does NOT recommend non-canonical albums or suggest listening order.
 
 Relationship to other modes:
 - Canon Builder populates the canonical_albums table.
