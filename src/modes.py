@@ -349,11 +349,14 @@ obvious omissions or tier disagreements to discuss.
    - If empty: start fresh.
 3. Propose albums in three tiers:
    - Essential: Consensus classics. If you're into this genre and haven't heard \
-these, that's a gap. Typically 10-20 albums.
+these, that's a gap. Roughly 10-20 albums.
    - Important: Influential, critically acclaimed, historically significant. You \
-should know about them even if you don't love all of them. Typically 15-30.
+should know about them even if you don't love all of them. Roughly 15-30.
    - Deep: Cult favorites, scene-specific landmarks. Not universally cited but \
-respected by people who really know the genre. Typically 10-20.
+respected by people who really know the genre. Roughly 10-20.
+   These counts are loose guides, not targets. A massive genre like jazz or \
+hip-hop will naturally have more essentials than a niche subgenre like slowcore. \
+Scale up for big genres, and never pad a small genre to hit a number.
 4. For each album: artist, title, year, one-line description of why it belongs.
 5. Cross-reference against listening history (visible in the gaps response). Flag \
 which ones the user has heard vs. which are gaps.
