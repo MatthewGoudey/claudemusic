@@ -199,3 +199,39 @@ def compact_canonical(rows: list[dict]) -> str:
         desc_str = f" — {desc}" if desc else ""
         lines.append(f"{artist} - {album}{year_str} [{genre_str}] {tier}{desc_str}")
     return "\n".join(lines)
+
+
+def compact_canonical_gaps(rows: list[dict]) -> str:
+    """Split canonical albums into UNHEARD/HEARD sections with listen stats."""
+    unheard = []
+    heard = []
+    for r in rows:
+        artist = r.get("artist", "?")
+        album = r.get("album", "?")
+        year = r.get("year")
+        year_str = f" ({year})" if year else ""
+        genre = r.get("genre", "")
+        subgenre = r.get("subgenre")
+        genre_str = f"{genre}/{subgenre}" if subgenre else genre
+        tier = r.get("tier", "")
+        desc = r.get("description", "")
+        desc_str = f" — {desc}" if desc else ""
+        listen_count = r.get("listen_count", 0)
+
+        if listen_count == 0:
+            unheard.append(f"  {artist} - {album}{year_str} [{genre_str}] {tier}{desc_str}")
+        else:
+            unique_tracks = r.get("unique_tracks", 0)
+            last_listen = r.get("last_listen")
+            last_str = _fmt_date(last_listen) if last_listen else ""
+            stats = f"{listen_count} plays, {unique_tracks} tracks"
+            if last_str:
+                stats += f", last heard {last_str}"
+            heard.append(f"  {artist} - {album}{year_str} [{genre_str}] {tier} — {stats}")
+
+    sections = []
+    if unheard:
+        sections.append("UNHEARD:\n" + "\n".join(unheard))
+    if heard:
+        sections.append("HEARD:\n" + "\n".join(heard))
+    return "\n\n".join(sections)

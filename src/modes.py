@@ -328,4 +328,57 @@ Overall score: "X artists you already love, Y started exploring, Z discovery can
 Ordered prep playlist: matched artists with incomplete albums first, then discovery entry points.
 Set time conflicts if daily schedule available.""",
     },
+    "canon-builder": {
+        "name": "Canon Builder",
+        "description": "Build and curate the canonical albums reference table for a genre.",
+        "spec": """\
+Mode: Canon Builder
+ID: canon-builder
+Purpose: Build and curate the canonical albums reference table for a genre. This is \
+the only mode where the primary output is writing to the database, not giving a \
+listening recommendation.
+
+When to use: When the user wants to define what "the canon" looks like for a genre — \
+the albums any serious listener should know about. This is curation, not discovery.
+
+Workflow:
+1. User specifies a genre (and optionally subgenre).
+2. Fetch existing canonical coverage: GET /api/canonical/gaps?genre={genre}
+   - If populated: show what's already there with listen counts, identify any \
+obvious omissions or tier disagreements to discuss.
+   - If empty: start fresh.
+3. Propose albums in three tiers:
+   - Essential: Consensus classics. If you're into this genre and haven't heard \
+these, that's a gap. Typically 10-20 albums.
+   - Important: Influential, critically acclaimed, historically significant. You \
+should know about them even if you don't love all of them. Typically 15-30.
+   - Deep: Cult favorites, scene-specific landmarks. Not universally cited but \
+respected by people who really know the genre. Typically 10-20.
+4. For each album: artist, title, year, one-line description of why it belongs.
+5. Cross-reference against listening history (visible in the gaps response). Flag \
+which ones the user has heard vs. which are gaps.
+6. Discuss with the user. They may promote, demote, add, or cut albums. Do not \
+silently include borderline picks — flag them for discussion.
+7. After agreement, batch-write: POST /api/canonical with the approved albums.
+
+Source philosophy:
+- Use multiple critical perspectives: RYM consensus, AOTY, Pitchfork, genre-specific \
+histories, Rolling Stone, Quietus, Bandcamp Daily. Never rely on a single source.
+- Don't pad the list. If a genre's canon is 25 albums deep, stop at 25. If it's 60, \
+go to 60. The number is genre-dependent, not fixed.
+- Note when an album bridges two genres — user may have it filed elsewhere.
+- Note when a pick is contentious or when you're uncertain.
+
+What this mode does NOT do:
+- This is not a recommendation session. Don't optimize for the user's taste.
+- Don't recommend non-canonical albums. That's what Gap Fill, Adjacent Genre, \
+and Cold Discovery modes are for.
+- Don't suggest listening order or build playlists. Just build the reference shelf.
+
+Relationship to other modes:
+- Canon Builder populates the canonical_albums table.
+- Gap Fill, Deep Discography, and other modes READ from it via /api/canonical/gaps \
+to give better recommendations.
+- After a Canon Builder session, all other modes become more useful for that genre.""",
+    },
 }

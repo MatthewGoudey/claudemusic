@@ -23,7 +23,8 @@ from src.modes import MODES
 from src.formatters import (
     compact_top_artists, compact_top_tracks, compact_top_albums,
     compact_recent, compact_album_completion, compact_chicago_shows_match,
-    compact_discover, compact_chicago_shows, compact_canonical, _fmt_ts,
+    compact_discover, compact_chicago_shows, compact_canonical,
+    compact_canonical_gaps, _fmt_ts,
 )
 import math
 
@@ -1623,6 +1624,94 @@ async def delete_canonical_by_match(
     if result == "DELETE 0":
         raise HTTPException(404, f"No canonical album found: {artist} - {album}")
     return {"deleted": True, "artist": artist, "album": album}
+
+
+@app.get("/api/canonical/gaps")
+async def canonical_gaps(
+    genre: Optional[str] = None,
+    subgenre: Optional[str] = None,
+    tier: Optional[str] = None,
+    heard: Optional[str] = None,
+    limit: int = Query(default=100, le=1000),
+    offset: int = Query(default=0, ge=0),
+    format: str = Query(default="compact", pattern="^(compact|json)$"),
+    _=Depends(verify_key),
+):
+    clauses = []
+    params = []
+
+    if genre:
+        params.append(genre)
+        clauses.append(f"LOWER(ca.genre) = LOWER(${len(params)})")
+    if subgenre:
+        params.append(subgenre)
+        clauses.append(f"LOWER(ca.subgenre) = LOWER(${len(params)})")
+    if tier:
+        params.append(tier)
+        clauses.append(f"ca.tier = ${len(params)}")
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    # Build HAVING clause for heard filter
+    having = ""
+    if heard == "true":
+        having = "HAVING COUNT(le.id) > 0"
+    elif heard == "false":
+        having = "HAVING COUNT(le.id) = 0"
+
+    params.extend([limit, offset])
+    limit_idx = len(params) - 1
+    offset_idx = len(params)
+
+    rows = await fetch_ro(f"""
+        SELECT
+            ca.id,
+            ca.artist,
+            ca.album,
+            ca.year,
+            ca.genre,
+            ca.subgenre,
+            ca.tier,
+            ca.description,
+            COUNT(le.id)::int AS listen_count,
+            COUNT(DISTINCT le.raw_title)::int AS unique_tracks,
+            MIN(le.listened_at) AS first_listen,
+            MAX(le.listened_at) AS last_listen
+        FROM canonical_albums ca
+        LEFT JOIN listen_events le
+            ON LOWER(le.raw_artist) LIKE '%%' || LOWER(ca.artist) || '%%'
+            AND LOWER(le.raw_album) LIKE '%%' || LOWER(ca.album) || '%%'
+        {where}
+        GROUP BY ca.id, ca.artist, ca.album, ca.year, ca.genre, ca.subgenre, ca.tier, ca.description
+        {having}
+        ORDER BY
+            COUNT(le.id) ASC,
+            CASE ca.tier WHEN 'essential' THEN 1 WHEN 'important' THEN 2 WHEN 'deep' THEN 3 ELSE 4 END,
+            ca.year NULLS LAST
+        LIMIT ${limit_idx} OFFSET ${offset_idx}
+    """, *params)
+
+    results = []
+    for r in rows:
+        row_dict = dict(r)
+        # Convert timestamps to ISO strings for JSON serialization
+        if row_dict.get("first_listen"):
+            row_dict["first_listen"] = row_dict["first_listen"].isoformat()
+        else:
+            row_dict["first_listen"] = None
+        if row_dict.get("last_listen"):
+            row_dict["last_listen"] = row_dict["last_listen"].isoformat()
+        else:
+            row_dict["last_listen"] = None
+        results.append(row_dict)
+
+    if format == "compact":
+        return PlainTextResponse(compact_canonical_gaps(results))
+    return {
+        "albums": results,
+        "count": len(results),
+        "filters": {"genre": genre, "subgenre": subgenre, "tier": tier, "heard": heard},
+    }
 
 
 # ============================================================
