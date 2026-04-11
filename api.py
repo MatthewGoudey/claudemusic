@@ -1655,9 +1655,9 @@ async def canonical_gaps(
     # Build HAVING clause for heard filter
     having = ""
     if heard == "true":
-        having = "HAVING COUNT(le.id) > 0"
+        having = "HAVING COUNT(le.event_id) > 0"
     elif heard == "false":
-        having = "HAVING COUNT(le.id) = 0"
+        having = "HAVING COUNT(le.event_id) = 0"
 
     params.extend([limit, offset])
     limit_idx = len(params) - 1
@@ -1673,19 +1673,19 @@ async def canonical_gaps(
             ca.subgenre,
             ca.tier,
             ca.description,
-            COUNT(le.id)::int AS listen_count,
+            COUNT(le.event_id)::int AS listen_count,
             COUNT(DISTINCT le.raw_title)::int AS unique_tracks,
             MIN(le.listened_at) AS first_listen,
             MAX(le.listened_at) AS last_listen
         FROM canonical_albums ca
         LEFT JOIN listen_events le
-            ON LOWER(le.raw_artist) LIKE '%%' || LOWER(ca.artist) || '%%'
-            AND LOWER(le.raw_album) LIKE '%%' || LOWER(ca.album) || '%%'
+            ON LOWER(le.raw_artist) LIKE '%' || LOWER(ca.artist) || '%'
+            AND LOWER(le.raw_album) LIKE '%' || LOWER(ca.album) || '%'
         {where}
         GROUP BY ca.id, ca.artist, ca.album, ca.year, ca.genre, ca.subgenre, ca.tier, ca.description
         {having}
         ORDER BY
-            COUNT(le.id) ASC,
+            COUNT(le.event_id) ASC,
             CASE ca.tier WHEN 'essential' THEN 1 WHEN 'important' THEN 2 WHEN 'deep' THEN 3 ELSE 4 END,
             ca.year NULLS LAST
         LIMIT ${limit_idx} OFFSET ${offset_idx}
