@@ -20,6 +20,7 @@ from src.filters import parse_date_filter, DateFilter
 from src.musicbrainz import resolve_single, resolve_all_missing, get_resolution_status
 from src.schema_registry import SCHEMA
 from src.modes import MODES
+from src.genres import CANONICAL_GENRES, CANONICAL_GENRE_SET, CANONICAL_GENRE_LOWER
 from src.formatters import (
     compact_top_artists, compact_top_tracks, compact_top_albums,
     compact_recent, compact_album_completion, compact_chicago_shows_match,
@@ -1536,9 +1537,20 @@ class CanonicalBatchRequest(BaseModel):
 @app.post("/api/canonical")
 async def upsert_canonical(body: CanonicalBatchRequest, _=Depends(verify_key)):
     valid_tiers = ("essential", "important", "deep")
+    bad_genres = []
     for entry in body.albums:
         if entry.tier not in valid_tiers:
             raise HTTPException(400, f"tier must be one of: {', '.join(valid_tiers)}")
+        # Auto-correct casing, reject unknown genres
+        if entry.genre in CANONICAL_GENRE_SET:
+            pass  # exact match
+        elif entry.genre.lower() in CANONICAL_GENRE_LOWER:
+            entry.genre = CANONICAL_GENRE_LOWER[entry.genre.lower()]
+        else:
+            bad_genres.append(entry.genre)
+    if bad_genres:
+        raise HTTPException(400, f"Unknown genre(s): {', '.join(set(bad_genres))}. "
+                            f"Use GET /api/canonical/genres for the full list.")
 
     count = 0
     for entry in body.albums:
@@ -1556,6 +1568,34 @@ async def upsert_canonical(body: CanonicalBatchRequest, _=Depends(verify_key)):
         count += 1
 
     return {"upserted": count}
+
+
+@app.get("/api/canonical/genres")
+async def list_genres(_=Depends(verify_key)):
+    """Return the full controlled genre vocabulary (122 genres)."""
+    return {"genres": CANONICAL_GENRES, "count": len(CANONICAL_GENRES)}
+
+
+@app.get("/api/canonical/coverage")
+async def genre_coverage(_=Depends(verify_key)):
+    """Return every genre with its album count (0 for unstarted)."""
+    rows = await fetch("""
+        SELECT genre, COUNT(*) as albums
+        FROM canonical_albums
+        GROUP BY genre
+    """)
+    counts = {r["genre"]: r["albums"] for r in rows}
+    coverage = [
+        {"genre": g, "albums": counts.get(g, 0)}
+        for g in CANONICAL_GENRES
+    ]
+    populated = sum(1 for c in coverage if c["albums"] > 0)
+    return {
+        "coverage": coverage,
+        "populated": populated,
+        "total_genres": len(CANONICAL_GENRES),
+        "total_albums": sum(c["albums"] for c in coverage),
+    }
 
 
 @app.get("/api/canonical")
