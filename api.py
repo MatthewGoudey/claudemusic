@@ -65,6 +65,11 @@ async def startup():
         if os.path.exists(canonical_sql):
             with open(canonical_sql) as f:
                 await conn.execute(f.read())
+        # Ensure canonical_listen_matches table exists
+        clm_sql = os.path.join(os.path.dirname(__file__), "sql", "canonical_listen_matches.sql")
+        if os.path.exists(clm_sql):
+            with open(clm_sql) as f:
+                await conn.execute(f.read())
         # Always update the normalize_artist function (fixes LOWER() ordering)
         await conn.execute("""
             CREATE OR REPLACE FUNCTION normalize_artist(name TEXT) RETURNS TEXT AS $$
@@ -1666,6 +1671,99 @@ async def delete_canonical_by_match(
     return {"deleted": True, "artist": artist, "album": album}
 
 
+@app.post("/api/canonical/matches/refresh")
+async def refresh_canonical_matches(_=Depends(verify_key)):
+    """Batch-match canonical albums to listen events using normalized text.
+
+    Matching strategy (applied in order, first match wins per event):
+    1. Exact normalized: lowercase, strip articles/parens/punctuation
+    2. Loose normalized: also strip common suffixes like (Deluxe), (Remaster)
+
+    Populates canonical_listen_matches table for fast gap queries.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Ensure the normalize_album helper exists
+        await conn.execute("""
+            CREATE OR REPLACE FUNCTION normalize_album(name TEXT) RETURNS TEXT AS $$
+                SELECT TRIM(REGEXP_REPLACE(
+                    REGEXP_REPLACE(
+                        LOWER(name),
+                        '\\s*\\(([^)]*(?:deluxe|remaster|expanded|anniversary|bonus|special|edition|version|explicit|clean|mono|stereo|original)[^)]*)\\)',
+                        '', 'gi'
+                    ),
+                    '[^a-z0-9\\s]', '', 'g'
+                ))
+            $$ LANGUAGE SQL IMMUTABLE
+        """)
+
+        # Truncate and repopulate
+        await conn.execute("TRUNCATE canonical_listen_matches")
+
+        # Pass 1: exact normalized match on both artist and album
+        result1 = await conn.execute("""
+            INSERT INTO canonical_listen_matches (canonical_id, event_id, match_method)
+            SELECT DISTINCT ca.id, le.event_id, 'normalized'
+            FROM canonical_albums ca
+            JOIN listen_events le
+                ON normalize_artist(le.raw_artist) = normalize_artist(ca.artist)
+                AND normalize_album(le.raw_album) = normalize_album(ca.album)
+            ON CONFLICT DO NOTHING
+        """)
+        pass1_count = int(result1.split()[-1]) if result1 else 0
+
+        # Pass 2: loose match — strip ALL parentheticals from both sides
+        # This catches "Zanaka (Deluxe)" matching "Zanaka",
+        # or "OK Computer OKNOTOK 1997 2017" matching "OK Computer"
+        await conn.execute("""
+            CREATE OR REPLACE FUNCTION normalize_album_loose(name TEXT) RETURNS TEXT AS $$
+                SELECT TRIM(REGEXP_REPLACE(
+                    REGEXP_REPLACE(
+                        LOWER(name),
+                        '\\s*\\([^)]*\\)', '', 'g'
+                    ),
+                    '[^a-z0-9\\s]', '', 'g'
+                ))
+            $$ LANGUAGE SQL IMMUTABLE
+        """)
+        result2 = await conn.execute("""
+            INSERT INTO canonical_listen_matches (canonical_id, event_id, match_method)
+            SELECT DISTINCT ca.id, le.event_id, 'normalized_loose'
+            FROM canonical_albums ca
+            JOIN listen_events le
+                ON normalize_artist(le.raw_artist) = normalize_artist(ca.artist)
+                AND normalize_album_loose(le.raw_album) = normalize_album_loose(ca.album)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM canonical_listen_matches clm
+                WHERE clm.canonical_id = ca.id AND clm.event_id = le.event_id
+            )
+            ON CONFLICT DO NOTHING
+        """)
+        pass2_count = int(result2.split()[-1]) if result2 else 0
+
+        # Get summary stats
+        stats = await conn.fetchrow("""
+            SELECT
+                COUNT(DISTINCT canonical_id) AS matched_albums,
+                COUNT(*) AS total_matches,
+                COUNT(DISTINCT event_id) AS matched_events
+            FROM canonical_listen_matches
+        """)
+
+        total_albums = await conn.fetchval("SELECT COUNT(*) FROM canonical_albums")
+
+    return {
+        "status": "ok",
+        "pass1_normalized": pass1_count,
+        "pass2_loose": pass2_count,
+        "total_matches": stats["total_matches"],
+        "matched_albums": stats["matched_albums"],
+        "total_albums": total_albums,
+        "unmatched_albums": total_albums - stats["matched_albums"],
+        "matched_events": stats["matched_events"],
+    }
+
+
 @app.get("/api/canonical/gaps")
 async def canonical_gaps(
     genre: Optional[str] = None,
@@ -1695,9 +1793,9 @@ async def canonical_gaps(
     # Build HAVING clause for heard filter
     having = ""
     if heard == "true":
-        having = "HAVING COUNT(le.event_id) > 0"
+        having = "HAVING COUNT(clm.event_id) > 0"
     elif heard == "false":
-        having = "HAVING COUNT(le.event_id) = 0"
+        having = "HAVING COUNT(clm.event_id) = 0"
 
     params.extend([limit, offset])
     limit_idx = len(params) - 1
@@ -1713,19 +1811,18 @@ async def canonical_gaps(
             ca.subgenre,
             ca.tier,
             ca.description,
-            COUNT(le.event_id)::int AS listen_count,
+            COUNT(clm.event_id)::int AS listen_count,
             COUNT(DISTINCT le.raw_title)::int AS unique_tracks,
             MIN(le.listened_at) AS first_listen,
             MAX(le.listened_at) AS last_listen
         FROM canonical_albums ca
-        LEFT JOIN listen_events le
-            ON LOWER(le.raw_artist) LIKE '%' || LOWER(ca.artist) || '%'
-            AND LOWER(le.raw_album) LIKE '%' || LOWER(ca.album) || '%'
+        LEFT JOIN canonical_listen_matches clm ON clm.canonical_id = ca.id
+        LEFT JOIN listen_events le ON le.event_id = clm.event_id
         {where}
         GROUP BY ca.id, ca.artist, ca.album, ca.year, ca.genre, ca.subgenre, ca.tier, ca.description
         {having}
         ORDER BY
-            COUNT(le.event_id) ASC,
+            COUNT(clm.event_id) ASC,
             CASE ca.tier WHEN 'essential' THEN 1 WHEN 'important' THEN 2 WHEN 'deep' THEN 3 ELSE 4 END,
             ca.year NULLS LAST
         LIMIT ${limit_idx} OFFSET ${offset_idx}
