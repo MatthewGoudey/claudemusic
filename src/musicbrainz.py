@@ -325,45 +325,72 @@ async def get_resolution_status() -> dict:
 
 
 async def audit_and_reresolve() -> dict:
-    """Find and re-resolve albums with quality issues.
+    """Comprehensive quality audit of all resolved albums.
 
-    1. Finds albums where user played more unique tracks than track_count
-    2. Re-resolves them with user_tracks_played hint
-    3. Flags box sets (track_count > 30)
+    Catches THREE types of issues:
+    1. tracks_played > track_count (resolver picked standard, user has deluxe)
+    2. track_count >> tracks_played on high-listen albums (resolver picked deluxe,
+       user has standard — the Doolittle/Demon Days problem)
+    3. Box sets (track_count > 30)
+
+    For type 2, re-resolves preferring the edition closest to what the user played.
     """
     # Flag box sets
-    box_set_count = await execute("""
+    await execute("""
         UPDATE album_tracklist SET quality_flag = 'box_set_suspect'
         WHERE track_count > 30 AND release_type = 'Album'
           AND source = 'musicbrainz' AND quality_flag IS NULL
     """)
 
-    # Find mismatches: albums where user played more unique tracks than track_count
-    mismatches = await fetch("""
+    # Type 1: user played MORE tracks than resolved (standard→deluxe)
+    overshoot = await fetch("""
         SELECT at.raw_artist, at.raw_album, at.track_count,
-               COUNT(DISTINCT le.raw_title) as tracks_played
+               COUNT(DISTINCT le.raw_title) as tracks_played,
+               COUNT(*) as total_listens
         FROM album_tracklist at
         JOIN listen_events le ON LOWER(at.raw_artist) = LOWER(le.raw_artist)
                               AND LOWER(at.raw_album) = LOWER(le.raw_album)
         WHERE at.source = 'musicbrainz' AND at.quality_flag IS NULL
         GROUP BY at.raw_artist, at.raw_album, at.track_count
         HAVING COUNT(DISTINCT le.raw_title) > at.track_count
-        ORDER BY COUNT(DISTINCT le.raw_title) - at.track_count DESC
+        ORDER BY COUNT(*) DESC
+    """)
+
+    # Type 2: high-listen albums where user played 70%+ of a SMALLER edition
+    # but track_count is inflated (deluxe→standard problem)
+    inflated = await fetch("""
+        SELECT at.raw_artist, at.raw_album, at.track_count,
+               COUNT(DISTINCT le.raw_title) as tracks_played,
+               COUNT(*) as total_listens
+        FROM album_tracklist at
+        JOIN listen_events le ON LOWER(at.raw_artist) = LOWER(le.raw_artist)
+                              AND LOWER(at.raw_album) = LOWER(le.raw_album)
+        WHERE at.source = 'musicbrainz'
+          AND at.quality_flag IS NULL
+          AND at.release_type = 'Album'
+          AND at.track_count <= 30
+        GROUP BY at.raw_artist, at.raw_album, at.track_count
+        HAVING COUNT(*) >= 20
+           AND COUNT(DISTINCT le.raw_title) < at.track_count
+           AND COUNT(DISTINCT le.raw_title) >= 5
+           AND COUNT(DISTINCT le.raw_title)::float / at.track_count BETWEEN 0.4 AND 0.85
+        ORDER BY COUNT(*) DESC
     """)
 
     reresolve_count = 0
     improved = 0
     still_mismatched = 0
+    inflated_fixed = 0
+    inflated_kept = 0
 
     async with httpx.AsyncClient(
         headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
         timeout=30,
     ) as client:
-        for row in mismatches:
-            artist = row["raw_artist"]
-            album = row["raw_album"]
-            old_count = row["track_count"]
-            tracks_played = row["tracks_played"]
+        # Fix type 1: overshoot — re-resolve preferring editions >= tracks_played
+        for row in overshoot:
+            artist, album = row["raw_artist"], row["raw_album"]
+            old_count, tracks_played = row["track_count"], row["tracks_played"]
 
             await asyncio.sleep(1.1)
             result = await resolve_album_tracklist(
@@ -380,16 +407,14 @@ async def audit_and_reresolve() -> dict:
                        WHERE raw_artist = $1 AND raw_album = $2""",
                     artist, album, track_count, release_type,
                     datetime.now(timezone.utc),
-                    f"Re-resolved: {old_count} -> {track_count} (user played {tracks_played})",
+                    f"Audit overshoot: {old_count} -> {track_count} (user played {tracks_played})",
                 )
                 await execute(
                     "DELETE FROM album_sessions WHERE LOWER(raw_artist) = LOWER($1) AND LOWER(raw_album) = LOWER($2)",
                     artist, album,
                 )
                 improved += 1
-                logger.info(f"Re-resolved: {artist} - {album}: {old_count} -> {track_count}")
             else:
-                # Mark as known mismatch (track name variants likely)
                 await execute(
                     """UPDATE album_tracklist SET quality_flag = 'track_count_mismatch',
                        resolution_notes = $3
@@ -399,9 +424,68 @@ async def audit_and_reresolve() -> dict:
                 )
                 still_mismatched += 1
 
+        # Fix type 2: inflated — re-resolve preferring editions closest to tracks_played
+        for row in inflated:
+            artist, album = row["raw_artist"], row["raw_album"]
+            old_count, tracks_played = row["track_count"], row["tracks_played"]
+
+            await asyncio.sleep(1.1)
+            # Search MB for all editions
+            clean_album = _clean_album_name(album)
+            releases = await _mb_search(client, f'"{clean_album}" AND artist:"{artist}"')
+
+            # Find all Album-type track counts
+            album_counts = []
+            for rel in releases:
+                rg = rel.get("release-group", {})
+                if rg.get("primary-type") != "Album":
+                    continue
+                tc = sum(m.get("track-count", 0) for m in rel.get("media", []))
+                if tc >= 5:
+                    album_counts.append(tc)
+
+            reresolve_count += 1
+
+            if not album_counts:
+                inflated_kept += 1
+                continue
+
+            # Pick the edition closest to (but >= ) tracks_played
+            # This prefers standard editions when user played standard track count
+            candidates = sorted(set(album_counts))
+            best = None
+            for tc in candidates:
+                if tc >= tracks_played:
+                    best = tc
+                    break
+            if best is None:
+                best = max(candidates)  # fallback to largest if none covers
+
+            if best != old_count:
+                await execute(
+                    """UPDATE album_tracklist
+                       SET track_count = $3, resolved_at = $4,
+                           quality_flag = NULL, resolution_notes = $5
+                       WHERE raw_artist = $1 AND raw_album = $2""",
+                    artist, album, best,
+                    datetime.now(timezone.utc),
+                    f"Audit inflated: {old_count} -> {best} (user played {tracks_played}, editions: {candidates})",
+                )
+                await execute(
+                    "DELETE FROM album_sessions WHERE LOWER(raw_artist) = LOWER($1) AND LOWER(raw_album) = LOWER($2)",
+                    artist, album,
+                )
+                inflated_fixed += 1
+                logger.info(f"Deflated: {artist} - {album}: {old_count} -> {best} (played {tracks_played})")
+            else:
+                inflated_kept += 1
+
     return {
-        "mismatches_found": len(mismatches),
+        "overshoot_found": len(overshoot),
+        "inflated_found": len(inflated),
         "reresolve_attempted": reresolve_count,
-        "improved": improved,
-        "still_mismatched": still_mismatched,
+        "overshoot_improved": improved,
+        "overshoot_kept": still_mismatched,
+        "inflated_fixed": inflated_fixed,
+        "inflated_kept": inflated_kept,
     }

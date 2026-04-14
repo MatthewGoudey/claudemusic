@@ -129,7 +129,7 @@ SCHEMA = {
         {
             "route": "/api/album-completion",
             "method": "GET",
-            "description": "Lifetime tracklist coverage per album. Default compact format returns 'Artist - Album: heard/total tracks (pct%)' one per line.",
+            "description": "All-time tracklist coverage per album — counts how many distinct tracks have EVER been played, regardless of when. NOT time-sensitive: playing 1 track/month for a year counts the same as playing the whole album in one sitting. Use /api/album-sessions instead for actual full album listens in a single sitting.",
             "params": {
                 "artist": {"type": "string", "required": False},
                 "start_date": {"type": "ISO date string", "required": False},
@@ -145,7 +145,7 @@ SCHEMA = {
         {
             "route": "/api/album-sessions",
             "method": "GET",
-            "description": "Detected full and partial album listening sessions (precomputed)",
+            "description": "Album listening sessions — times the user sat down and played through an album in one sitting (precomputed, gap-based detection). Use session_type=full for complete album listens. THIS is the correct endpoint for 'albums listened to all the way through', 'most replayed albums', 'have I finished this album', etc. Prefer this over /api/album-completion for any question about album listening behavior.",
             "params": {
                 "artist": {"type": "string", "required": False},
                 "album": {"type": "string", "required": False},
@@ -162,7 +162,7 @@ SCHEMA = {
         {
             "route": "/api/album-sessions/stats",
             "method": "GET",
-            "description": "Aggregate session stats: totals, by-year breakdown, top 25 albums by full sessions",
+            "description": "Aggregate album session stats: total full/partial sessions, by-year breakdown, top 25 most-replayed albums. Best endpoint for 'what albums do I listen to most' and 'how many albums have I finished'.",
             "params": {
                 "start_date": {"type": "ISO date string", "required": False},
                 "end_date": {"type": "ISO date string", "required": False},
