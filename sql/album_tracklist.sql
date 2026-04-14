@@ -8,6 +8,9 @@ CREATE TABLE IF NOT EXISTS album_tracklist (
     track_count INTEGER NOT NULL,
     source      TEXT NOT NULL DEFAULT 'musicbrainz',
     resolved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    release_type TEXT NOT NULL DEFAULT 'unknown',
+    quality_flag TEXT,
+    resolution_notes TEXT,
     PRIMARY KEY (raw_artist, raw_album)
 );
 

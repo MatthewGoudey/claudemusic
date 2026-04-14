@@ -17,7 +17,8 @@ from pydantic import BaseModel
 from src.database import get_pool, get_ro_pool, close_pools, fetch, fetchrow, fetchval, fetch_ro, execute
 from src.auth import verify_key
 from src.filters import parse_date_filter, DateFilter
-from src.musicbrainz import resolve_single, resolve_all_missing, get_resolution_status
+from src.musicbrainz import resolve_single, resolve_all_missing, get_resolution_status, audit_and_reresolve
+from src.lastfm import resolve_missing_via_lastfm
 from src.schema_registry import SCHEMA
 from src.modes import MODES
 from src.genres import CANONICAL_GENRES, CANONICAL_GENRE_SET, CANONICAL_GENRE_LOWER
@@ -70,6 +71,12 @@ async def startup():
         if os.path.exists(clm_sql):
             with open(clm_sql) as f:
                 await conn.execute(f.read())
+        # Ensure album_tracklist has quality tracking columns
+        await conn.execute("""
+            ALTER TABLE album_tracklist ADD COLUMN IF NOT EXISTS release_type TEXT NOT NULL DEFAULT 'unknown';
+            ALTER TABLE album_tracklist ADD COLUMN IF NOT EXISTS quality_flag TEXT;
+            ALTER TABLE album_tracklist ADD COLUMN IF NOT EXISTS resolution_notes TEXT;
+        """)
         # Always update the normalize_artist function (fixes LOWER() ordering)
         await conn.execute("""
             CREATE OR REPLACE FUNCTION normalize_artist(name TEXT) RETURNS TEXT AS $$
@@ -930,6 +937,47 @@ async def resolver_status(_=Depends(verify_key)):
     return await get_resolution_status()
 
 
+class ManualOverrideRequest(BaseModel):
+    artist: str
+    album: str
+    track_count: int
+    release_type: str = "Album"
+    notes: str = ""
+
+
+@app.post("/api/album-tracklist-override")
+async def manual_tracklist_override(body: ManualOverrideRequest, _=Depends(verify_key)):
+    """Manually set or override an album's track count and release type."""
+    from datetime import datetime, timezone
+    await execute(
+        """INSERT INTO album_tracklist (raw_artist, raw_album, track_count, release_type, source, resolved_at, resolution_notes)
+           VALUES ($1, $2, $3, $4, 'manual', $5, $6)
+           ON CONFLICT (raw_artist, raw_album)
+           DO UPDATE SET track_count = $3, release_type = $4, source = 'manual',
+                         resolved_at = $5, resolution_notes = $6, quality_flag = 'manual_verified'""",
+        body.artist, body.album, body.track_count, body.release_type,
+        datetime.now(timezone.utc), body.notes,
+    )
+    await execute(
+        "DELETE FROM album_sessions WHERE LOWER(raw_artist) = LOWER($1) AND LOWER(raw_album) = LOWER($2)",
+        body.artist, body.album,
+    )
+    return {"status": "ok", "artist": body.artist, "album": body.album, "track_count": body.track_count}
+
+
+@app.post("/api/album-tracklist-audit")
+async def trigger_audit(_=Depends(verify_key)):
+    """Re-resolve albums with quality issues (tracks_played > track_count, box sets)."""
+    return await audit_and_reresolve()
+
+
+@app.post("/api/album-tracklist-lastfm")
+async def trigger_lastfm_resolver(body: dict = {}, _=Depends(verify_key)):
+    """Resolve unresolved albums using Last.fm as fallback source."""
+    limit = body.get("limit", 500) if body else 500
+    return await resolve_missing_via_lastfm(limit=limit)
+
+
 # ============================================================
 # Ad-hoc query (secured with read-only DB role)
 # ============================================================
@@ -1769,7 +1817,7 @@ async def canonical_gaps(
     genre: Optional[str] = None,
     subgenre: Optional[str] = None,
     tier: Optional[str] = None,
-    heard: Optional[str] = None,
+    heard: Optional[str] = Query(default=None, pattern="^(true|false)$"),
     limit: int = Query(default=100, le=1000),
     offset: int = Query(default=0, ge=0),
     format: str = Query(default="compact", pattern="^(compact|json)$"),

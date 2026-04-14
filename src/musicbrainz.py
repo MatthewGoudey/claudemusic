@@ -27,37 +27,75 @@ EDITION_EXCLUDE = re.compile(
 )
 
 # Patterns to strip from album names before searching MusicBrainz.
-# Spotify adds these suffixes; MB doesn't use them.
+# Spotify/ListenBrainz add these suffixes; MB doesn't use them.
 _ALBUM_CLEAN_PATTERNS = [
-    re.compile(r'\s*\[([^\]]*)\]\s*$'),           # [Standard Edition], [Deluxe], etc.
-    re.compile(r'\s*\(([^)]*(?:edition|remaster|version|deluxe|expanded|anniversary|bonus|mono|stereo|remix|original)[^)]*)\)\s*$', re.IGNORECASE),
+    re.compile(r'\s*\[([^\]]*)\]\s*$'),           # [Standard Edition], [Deluxe], [Original Game Soundtrack]
+    re.compile(r'\s*\(([^)]*(?:edition|remaster|version|deluxe|expanded|anniversary|bonus|mono|stereo|remix|original|complete|soundtrack)[^)]*)\)\s*$', re.IGNORECASE),
     re.compile(r'\s*[-–—]\s*(EP|Single|Deluxe|Remastered|Bonus Track Version)\s*$', re.IGNORECASE),
-    re.compile(r'\s*\(feat\.[^)]*\)\s*$', re.IGNORECASE),
+    re.compile(r'\s*[-–—]\s*\w+(?:\s+\w+)?\s+(?:Edition|Version)\s*$', re.IGNORECASE),  # "- Real Life Edition", "- Deluxe Edition"
+    re.compile(r'\s*\(feat\.?\s[^)]*\)\s*$', re.IGNORECASE),
+    re.compile(r'\s*\(Complete\)\s*$', re.IGNORECASE),  # "(Complete)"
+    re.compile(r'\s+EP\s*$', re.IGNORECASE),  # trailing " EP"
+    re.compile(r'\s+b/w\s+.*$', re.IGNORECASE),  # "b/w Other Side" coupling
 ]
+
+# Wrapping quotes pattern (applied separately to avoid stripping internal quotes)
+_QUOTE_WRAP = re.compile(r'^["\'""]+(.+?)["\'""]+$')
+
+# Artist prefix pattern — only used as fallback, never first attempt
+_ARTIST_PREFIX = re.compile(r'^(Ms\.?|Mr\.?)\s+', re.IGNORECASE)
 
 
 def _clean_album_name(album: str) -> str:
-    """Strip Spotify edition suffixes that prevent MusicBrainz matches."""
+    """Strip Spotify/scrobble edition suffixes that prevent MusicBrainz matches."""
     cleaned = album
+    # Strip wrapping quotes first
+    m = _QUOTE_WRAP.match(cleaned)
+    if m:
+        cleaned = m.group(1)
     for pattern in _ALBUM_CLEAN_PATTERNS:
         cleaned = pattern.sub('', cleaned)
     return cleaned.strip()
 
 
-async def resolve_album_tracklist(
-    client: httpx.AsyncClient,
-    artist: str,
-    album: str,
-) -> tuple[int, str] | None:
-    """Query MusicBrainz for an album's track count and release type.
+def _clean_artist_name(artist: str) -> str:
+    """Strip common artist name prefixes (Ms., Mr.) for MB search fallback."""
+    return _ARTIST_PREFIX.sub('', artist).strip()
 
-    Searches the release endpoint, groups results by release-group primary-type,
-    prefers Album > EP > Single. Returns (track_count, release_type) or None.
+
+def _split_artists(artist: str) -> list[str]:
+    """Return artist name candidates in priority order.
+
+    For comma-separated strings, returns [original, first_artist].
+    Guards against "Tyler, The Creator" by not splitting when the
+    post-comma segment starts with The/A/An.
     """
-    clean = _clean_album_name(album)
-    query = f'"{clean}" AND artist:"{artist}"'
-    params = {"query": query, "fmt": "json", "limit": "25"}
+    candidates = [artist]
 
+    # Comma splitting (but not "Tyler, The Creator")
+    if ',' in artist:
+        parts = [p.strip() for p in artist.split(',', 1)]
+        if len(parts) == 2 and not re.match(r'\s*(The|A|An)\s', parts[1], re.IGNORECASE):
+            candidates.append(parts[0])
+
+    # Featuring/collaboration splitting
+    for sep in (' feat. ', ' feat ', ' ft. ', ' ft ', ' & ', ' and ', ' with ', ' x ', ' vs. ', ' vs '):
+        idx = artist.lower().find(sep.lower())
+        if idx > 0:
+            first = artist[:idx].strip()
+            if first and first not in candidates:
+                candidates.append(first)
+            break
+
+    return candidates
+
+
+async def _mb_search(
+    client: httpx.AsyncClient,
+    query: str,
+) -> list[dict]:
+    """Execute a MusicBrainz release search query. Handles 503 rate limits."""
+    params = {"query": query, "fmt": "json", "limit": "25"}
     try:
         resp = await client.get(f"{MB_BASE}/release", params=params)
         if resp.status_code == 503:
@@ -65,29 +103,22 @@ async def resolve_album_tracklist(
             await asyncio.sleep(5)
             resp = await client.get(f"{MB_BASE}/release", params=params)
         resp.raise_for_status()
-        data = resp.json()
+        return resp.json().get("releases", [])
     except Exception as e:
-        logger.error(f"MB API error for '{artist}' - '{album}': {e}")
-        return None
+        logger.error(f"MB API error for query '{query}': {e}")
+        return []
 
-    releases = data.get("releases", [])
 
-    # Fallback: if exact match returned nothing and we cleaned the name, try unquoted
-    if not releases and clean != album:
-        fallback_query = f'{clean} AND artist:"{artist}"'
-        params["query"] = fallback_query
-        try:
-            await asyncio.sleep(1.1)
-            resp = await client.get(f"{MB_BASE}/release", params=params)
-            resp.raise_for_status()
-            releases = resp.json().get("releases", [])
-        except Exception:
-            pass
+def _pick_best_release(
+    releases: list[dict],
+    user_tracks_played: int | None = None,
+) -> tuple[int, str] | None:
+    """From a list of MB releases, pick the best (track_count, release_type).
 
-    if not releases:
-        return None
-
-    # Group track counts by release type, preferring Album > EP > Single
+    Groups by release-group primary-type, prefers Album > EP > Single.
+    If user_tracks_played is provided, prefers releases with track_count >= that value
+    to avoid resolving to standard editions when user listened to deluxe.
+    """
     by_type: dict[str, list[int]] = {}
     by_type_unfiltered: dict[str, list[int]] = {}
 
@@ -109,30 +140,90 @@ async def resolve_album_tracklist(
             continue
         by_type.setdefault(primary_type, []).append(total)
 
-    # Pick best type in preference order
     for release_type in ("Album", "EP", "Single"):
-        counts = by_type.get(release_type, [])
-        if release_type == "Album":
-            counts = [c for c in counts if c >= 5]
-        if counts:
-            return int(statistics.median(counts)), release_type
+        for source in (by_type, by_type_unfiltered):
+            counts = source.get(release_type, [])
+            if release_type == "Album":
+                counts = [c for c in counts if c >= 5]
+            if not counts:
+                continue
 
-        counts = by_type_unfiltered.get(release_type, [])
-        if release_type == "Album":
-            counts = [c for c in counts if c >= 5]
-        if counts:
+            # If we know how many tracks the user played, prefer editions
+            # that cover at least that many tracks
+            if user_tracks_played and release_type == "Album":
+                covering = [c for c in counts if c >= user_tracks_played]
+                if covering:
+                    return int(statistics.median(covering)), release_type
+
             return int(statistics.median(counts)), release_type
 
     return None
 
 
-async def resolve_single(artist: str, album: str) -> dict:
+async def resolve_album_tracklist(
+    client: httpx.AsyncClient,
+    artist: str,
+    album: str,
+    user_tracks_played: int | None = None,
+) -> tuple[int, str] | None:
+    """Query MusicBrainz for an album's track count and release type.
+
+    Uses multi-strategy search: cleaned names, artist variants, unquoted fallbacks.
+    If user_tracks_played is provided, prefers editions covering that many tracks.
+    Returns (track_count, release_type) or None.
+    """
+    clean_album = _clean_album_name(album)
+    artist_candidates = _split_artists(artist)
+
+    # Strategy 1: Original artist + cleaned album (exact quoted)
+    releases = await _mb_search(client, f'"{clean_album}" AND artist:"{artist}"')
+    result = _pick_best_release(releases, user_tracks_played)
+    if result:
+        return result
+
+    # Strategy 2: Cleaned artist name (strip Ms., Mr.) + cleaned album
+    cleaned_artist = _clean_artist_name(artist)
+    if cleaned_artist != artist:
+        await asyncio.sleep(1.1)
+        releases = await _mb_search(client, f'"{clean_album}" AND artist:"{cleaned_artist}"')
+        result = _pick_best_release(releases, user_tracks_played)
+        if result:
+            return result
+
+    # Strategy 3: First artist from comma/feat split + cleaned album
+    for candidate in artist_candidates[1:]:  # skip index 0, already tried
+        await asyncio.sleep(1.1)
+        releases = await _mb_search(client, f'"{clean_album}" AND artist:"{candidate}"')
+        result = _pick_best_release(releases, user_tracks_played)
+        if result:
+            return result
+
+    # Strategy 4: Unquoted search (fuzzy) with original artist
+    if clean_album != album:
+        await asyncio.sleep(1.1)
+        releases = await _mb_search(client, f'{clean_album} AND artist:"{artist}"')
+        result = _pick_best_release(releases, user_tracks_played)
+        if result:
+            return result
+
+    # Strategy 5: Unquoted search with cleaned artist
+    if cleaned_artist != artist:
+        await asyncio.sleep(1.1)
+        releases = await _mb_search(client, f'{clean_album} AND artist:"{cleaned_artist}"')
+        result = _pick_best_release(releases, user_tracks_played)
+        if result:
+            return result
+
+    return None
+
+
+async def resolve_single(artist: str, album: str, user_tracks_played: int | None = None) -> dict:
     """Resolve a single artist+album pair and store the result."""
     async with httpx.AsyncClient(
         headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
         timeout=30,
     ) as client:
-        result = await resolve_album_tracklist(client, artist, album)
+        result = await resolve_album_tracklist(client, artist, album, user_tracks_played)
 
     if result is not None:
         track_count, release_type = result
@@ -230,4 +321,87 @@ async def get_resolution_status() -> dict:
         "resolved": resolved,
         "unresolved": unresolved,
         "resolution_rate": rate,
+    }
+
+
+async def audit_and_reresolve() -> dict:
+    """Find and re-resolve albums with quality issues.
+
+    1. Finds albums where user played more unique tracks than track_count
+    2. Re-resolves them with user_tracks_played hint
+    3. Flags box sets (track_count > 30)
+    """
+    # Flag box sets
+    box_set_count = await execute("""
+        UPDATE album_tracklist SET quality_flag = 'box_set_suspect'
+        WHERE track_count > 30 AND release_type = 'Album'
+          AND source = 'musicbrainz' AND quality_flag IS NULL
+    """)
+
+    # Find mismatches: albums where user played more unique tracks than track_count
+    mismatches = await fetch("""
+        SELECT at.raw_artist, at.raw_album, at.track_count,
+               COUNT(DISTINCT le.raw_title) as tracks_played
+        FROM album_tracklist at
+        JOIN listen_events le ON LOWER(at.raw_artist) = LOWER(le.raw_artist)
+                              AND LOWER(at.raw_album) = LOWER(le.raw_album)
+        WHERE at.source = 'musicbrainz' AND at.quality_flag IS NULL
+        GROUP BY at.raw_artist, at.raw_album, at.track_count
+        HAVING COUNT(DISTINCT le.raw_title) > at.track_count
+        ORDER BY COUNT(DISTINCT le.raw_title) - at.track_count DESC
+    """)
+
+    reresolve_count = 0
+    improved = 0
+    still_mismatched = 0
+
+    async with httpx.AsyncClient(
+        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+        timeout=30,
+    ) as client:
+        for row in mismatches:
+            artist = row["raw_artist"]
+            album = row["raw_album"]
+            old_count = row["track_count"]
+            tracks_played = row["tracks_played"]
+
+            await asyncio.sleep(1.1)
+            result = await resolve_album_tracklist(
+                client, artist, album, user_tracks_played=tracks_played
+            )
+            reresolve_count += 1
+
+            if result and result[0] != old_count:
+                track_count, release_type = result
+                await execute(
+                    """UPDATE album_tracklist
+                       SET track_count = $3, release_type = $4, resolved_at = $5,
+                           quality_flag = NULL, resolution_notes = $6
+                       WHERE raw_artist = $1 AND raw_album = $2""",
+                    artist, album, track_count, release_type,
+                    datetime.now(timezone.utc),
+                    f"Re-resolved: {old_count} -> {track_count} (user played {tracks_played})",
+                )
+                await execute(
+                    "DELETE FROM album_sessions WHERE LOWER(raw_artist) = LOWER($1) AND LOWER(raw_album) = LOWER($2)",
+                    artist, album,
+                )
+                improved += 1
+                logger.info(f"Re-resolved: {artist} - {album}: {old_count} -> {track_count}")
+            else:
+                # Mark as known mismatch (track name variants likely)
+                await execute(
+                    """UPDATE album_tracklist SET quality_flag = 'track_count_mismatch',
+                       resolution_notes = $3
+                       WHERE raw_artist = $1 AND raw_album = $2""",
+                    artist, album,
+                    f"User played {tracks_played} unique tracks vs {old_count} resolved",
+                )
+                still_mismatched += 1
+
+    return {
+        "mismatches_found": len(mismatches),
+        "reresolve_attempted": reresolve_count,
+        "improved": improved,
+        "still_mismatched": still_mismatched,
     }
