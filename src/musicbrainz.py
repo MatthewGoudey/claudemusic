@@ -246,8 +246,8 @@ async def resolve_single(artist: str, album: str, user_tracks_played: int | None
 
 async def resolve_all_missing() -> dict:
     """Resolve all albums in listen_events that aren't in album_tracklist."""
-    # Re-resolve entries missing release_type
-    await execute("DELETE FROM album_tracklist WHERE release_type = 'unknown'")
+    # Re-resolve entries missing release_type (but keep tombstones)
+    await execute("DELETE FROM album_tracklist WHERE release_type = 'unknown' AND source != 'unresolvable'")
 
     # Find unresolved albums
     unresolved = await fetch("""
@@ -293,9 +293,16 @@ async def resolve_all_missing() -> dict:
                 resolved += 1
                 logger.info(f"Resolved: {artist} - {album} ({track_count} tracks, {release_type})")
             else:
+                # Insert tombstone so this album is skipped on future runs
+                await execute(
+                    """INSERT INTO album_tracklist (raw_artist, raw_album, track_count, release_type, source, resolved_at, resolution_notes)
+                       VALUES ($1, $2, 0, 'unknown', 'unresolvable', $3, 'No match in MusicBrainz')
+                       ON CONFLICT (raw_artist, raw_album) DO NOTHING""",
+                    artist, album, datetime.now(timezone.utc),
+                )
                 failed += 1
                 failures.append({"raw_artist": artist, "raw_album": album, "error": "No match found"})
-                logger.warning(f"Failed: {artist} - {album}")
+                logger.warning(f"Failed (tombstoned): {artist} - {album}")
 
     return {
         "resolved": resolved,
