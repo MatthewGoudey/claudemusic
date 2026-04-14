@@ -111,13 +111,12 @@ async def _mb_search(
 
 def _pick_best_release(
     releases: list[dict],
-    user_tracks_played: int | None = None,
 ) -> tuple[int, str] | None:
     """From a list of MB releases, pick the best (track_count, release_type).
 
     Groups by release-group primary-type, prefers Album > EP > Single.
-    If user_tracks_played is provided, prefers releases with track_count >= that value
-    to avoid resolving to standard editions when user listened to deluxe.
+    Uses MINIMUM non-excluded track count to naturally prefer standard editions
+    over deluxe/remaster/box set editions.
     """
     by_type: dict[str, list[int]] = {}
     by_type_unfiltered: dict[str, list[int]] = {}
@@ -147,15 +146,7 @@ def _pick_best_release(
                 counts = [c for c in counts if c >= 5]
             if not counts:
                 continue
-
-            # If we know how many tracks the user played, prefer editions
-            # that cover at least that many tracks
-            if user_tracks_played and release_type == "Album":
-                covering = [c for c in counts if c >= user_tracks_played]
-                if covering:
-                    return int(statistics.median(covering)), release_type
-
-            return int(statistics.median(counts)), release_type
+            return min(counts), release_type
 
     return None
 
@@ -164,12 +155,11 @@ async def resolve_album_tracklist(
     client: httpx.AsyncClient,
     artist: str,
     album: str,
-    user_tracks_played: int | None = None,
 ) -> tuple[int, str] | None:
     """Query MusicBrainz for an album's track count and release type.
 
     Uses multi-strategy search: cleaned names, artist variants, unquoted fallbacks.
-    If user_tracks_played is provided, prefers editions covering that many tracks.
+    Prefers the smallest (standard) edition via min() over median().
     Returns (track_count, release_type) or None.
     """
     clean_album = _clean_album_name(album)
@@ -177,7 +167,7 @@ async def resolve_album_tracklist(
 
     # Strategy 1: Original artist + cleaned album (exact quoted)
     releases = await _mb_search(client, f'"{clean_album}" AND artist:"{artist}"')
-    result = _pick_best_release(releases, user_tracks_played)
+    result = _pick_best_release(releases)
     if result:
         return result
 
@@ -186,7 +176,7 @@ async def resolve_album_tracklist(
     if cleaned_artist != artist:
         await asyncio.sleep(1.1)
         releases = await _mb_search(client, f'"{clean_album}" AND artist:"{cleaned_artist}"')
-        result = _pick_best_release(releases, user_tracks_played)
+        result = _pick_best_release(releases)
         if result:
             return result
 
@@ -194,7 +184,7 @@ async def resolve_album_tracklist(
     for candidate in artist_candidates[1:]:  # skip index 0, already tried
         await asyncio.sleep(1.1)
         releases = await _mb_search(client, f'"{clean_album}" AND artist:"{candidate}"')
-        result = _pick_best_release(releases, user_tracks_played)
+        result = _pick_best_release(releases)
         if result:
             return result
 
@@ -202,7 +192,7 @@ async def resolve_album_tracklist(
     if clean_album != album:
         await asyncio.sleep(1.1)
         releases = await _mb_search(client, f'{clean_album} AND artist:"{artist}"')
-        result = _pick_best_release(releases, user_tracks_played)
+        result = _pick_best_release(releases)
         if result:
             return result
 
@@ -210,20 +200,20 @@ async def resolve_album_tracklist(
     if cleaned_artist != artist:
         await asyncio.sleep(1.1)
         releases = await _mb_search(client, f'{clean_album} AND artist:"{cleaned_artist}"')
-        result = _pick_best_release(releases, user_tracks_played)
+        result = _pick_best_release(releases)
         if result:
             return result
 
     return None
 
 
-async def resolve_single(artist: str, album: str, user_tracks_played: int | None = None) -> dict:
+async def resolve_single(artist: str, album: str) -> dict:
     """Resolve a single artist+album pair and store the result."""
     async with httpx.AsyncClient(
         headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
         timeout=30,
     ) as client:
-        result = await resolve_album_tracklist(client, artist, album, user_tracks_played)
+        result = await resolve_album_tracklist(client, artist, album)
 
     if result is not None:
         track_count, release_type = result
@@ -401,7 +391,7 @@ async def audit_and_reresolve() -> dict:
 
             await asyncio.sleep(1.1)
             result = await resolve_album_tracklist(
-                client, artist, album, user_tracks_played=tracks_played
+                client, artist, album
             )
             reresolve_count += 1
 
