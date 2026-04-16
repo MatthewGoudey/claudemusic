@@ -42,13 +42,16 @@ def _fmt_ts(ts) -> str:
 
 
 def compact_top_artists(rows: list[dict]) -> str:
-    """'Artist (plays/Nt)' comma-separated."""
+    """'Artist (plays/Nt [Fs/Ps])' comma-separated."""
     parts = []
     for r in rows:
         name = r.get("raw_artist", "?")
         plays = r.get("listen_count", 0)
         tracks = r.get("unique_tracks", 0)
-        parts.append(f"{name} ({plays}/{tracks}t)")
+        full = r.get("full_sessions", 0)
+        partial = r.get("partial_sessions", 0)
+        sess = f" [{full}f/{partial}p]" if full or partial else ""
+        parts.append(f"{name} ({plays}/{tracks}t{sess})")
     return ", ".join(parts)
 
 
@@ -64,13 +67,16 @@ def compact_top_tracks(rows: list[dict]) -> str:
 
 
 def compact_top_albums(rows: list[dict]) -> str:
-    """'Artist - Album (plays)' comma-separated."""
+    """'Artist - Album (plays [Fs/Ps])' comma-separated."""
     parts = []
     for r in rows:
         artist = r.get("raw_artist", "?")
         album = r.get("raw_album", "?")
         plays = r.get("listen_count", 0)
-        parts.append(f"{artist} - {album} ({plays})")
+        full = r.get("full_sessions", 0)
+        partial = r.get("partial_sessions", 0)
+        sess = f" [{full}f/{partial}p]" if full or partial else ""
+        parts.append(f"{artist} - {album} ({plays}{sess})")
     return ", ".join(parts)
 
 
@@ -224,7 +230,11 @@ def compact_canonical_gaps(rows: list[dict]) -> str:
             unique_tracks = r.get("unique_tracks", 0)
             last_listen = r.get("last_listen")
             last_str = _fmt_date(last_listen) if last_listen else ""
+            full = r.get("full_sessions", 0)
+            partial = r.get("partial_sessions", 0)
             stats = f"{listen_count} plays, {unique_tracks} tracks"
+            if full or partial:
+                stats += f", {full}f/{partial}p sessions"
             if last_str:
                 stats += f", last heard {last_str}"
             heard.append(f"  {artist} - {album}{year_str} [{genre_str}] {tier} — {stats}")

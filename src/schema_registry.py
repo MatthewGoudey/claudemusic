@@ -50,14 +50,14 @@ SCHEMA = {
         {
             "route": "/api/summary",
             "method": "GET",
-            "description": "High-level stats: total listens, unique tracks/artists, platform breakdown",
+            "description": "High-level stats: total listens, unique tracks/artists, platform breakdown, album session stats (full/partial counts)",
             "params": {},
             "auth": True,
         },
         {
             "route": "/api/top-artists",
             "method": "GET",
-            "description": "Top artists by listen count. Default compact format returns 'Artist (plays/Nt)' comma-separated plain text.",
+            "description": "Top artists by listen count with album session counts (full/partial). Default compact format returns 'Artist (plays/Nt [Fs/Ps])' comma-separated plain text.",
             "params": {
                 "start_date": {"type": "ISO date string", "required": False},
                 "end_date": {"type": "ISO date string", "required": False},
@@ -84,7 +84,7 @@ SCHEMA = {
         {
             "route": "/api/top-albums",
             "method": "GET",
-            "description": "Top albums by listen count. Default compact format returns 'Artist - Album (plays)' comma-separated plain text.",
+            "description": "Top albums by listen count with album session counts (full/partial). Default compact format returns 'Artist - Album (plays [Fs/Ps])' comma-separated plain text.",
             "params": {
                 "artist": {"type": "string", "required": False},
                 "start_date": {"type": "ISO date string", "required": False},
@@ -98,7 +98,7 @@ SCHEMA = {
         {
             "route": "/api/timeline",
             "method": "GET",
-            "description": "Listen counts over time at day/week/month/year granularity",
+            "description": "Listen counts and album session counts (full/partial/total) over time at day/week/month/year granularity",
             "params": {
                 "granularity": {"type": "string", "required": False, "default": "month", "enum": ["day", "week", "month", "year"]},
                 "start_date": {"type": "ISO date string", "required": False},
@@ -120,7 +120,7 @@ SCHEMA = {
         {
             "route": "/api/artist/{artist_name}",
             "method": "GET",
-            "description": "Detailed stats for a specific artist: total listens, top tracks, yearly breakdown",
+            "description": "Detailed stats for a specific artist: total listens, top tracks, yearly breakdown, session summary (full/partial counts), recent album sessions",
             "params": {
                 "artist_name": {"type": "string", "required": True, "location": "path"},
             },
@@ -325,7 +325,7 @@ SCHEMA = {
         {
             "route": "/api/canonical/gaps",
             "method": "GET",
-            "description": "Coverage report: joins canonical albums against listening history to show heard/unheard status with play counts and dates.",
+            "description": "Coverage report: joins canonical albums against listening history to show heard/unheard status with play counts, dates, and album session counts (full/partial).",
             "params": {
                 "genre": {"type": "string", "required": False, "description": "Filter by genre (case-insensitive)"},
                 "subgenre": {"type": "string", "required": False, "description": "Filter by subgenre (case-insensitive)"},

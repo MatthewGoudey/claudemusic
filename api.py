@@ -293,9 +293,16 @@ async def session_start(
         WHERE cs.show_date >= CURRENT_DATE
         ORDER BY cs.show_date ASC LIMIT 20
     """)
+    session_stats_task = fetchrow("""
+        SELECT
+            COUNT(*) AS total_sessions,
+            COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
+            COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
+        FROM album_sessions
+    """)
 
-    recent_rows, top_recent, top_alltime, summary_row, interests = await asyncio.gather(
-        recent_task, top_recent_task, top_alltime_task, summary_task, interests_task
+    recent_rows, top_recent, top_alltime, summary_row, interests, session_stats = await asyncio.gather(
+        recent_task, top_recent_task, top_alltime_task, summary_task, interests_task, session_stats_task
     )
 
     mode_id, mode_reason = _suggest_mode(recent_rows, top_recent, top_alltime)
@@ -306,6 +313,7 @@ async def session_start(
             "top_artists_recent": top_recent,
             "top_artists_alltime": top_alltime,
             "summary": summary_row or {},
+            "sessions": session_stats or {},
             "tracked_shows": interests,
             "suggested_mode": {"id": mode_id, "reason": mode_reason},
         }
@@ -346,6 +354,11 @@ async def session_start(
         "tracked_shows": tracked,
         "total_listens": summary_row["total_listens"] if summary_row else 0,
         "unique_artists": summary_row["unique_artists"] if summary_row else 0,
+        "sessions": {
+            "total": session_stats["total_sessions"] if session_stats else 0,
+            "full": session_stats["full_sessions"] if session_stats else 0,
+            "partial": session_stats["partial_sessions"] if session_stats else 0,
+        },
     }
 
 
@@ -355,7 +368,7 @@ async def session_start(
 
 @app.get("/api/summary")
 async def summary(_=Depends(verify_key)):
-    rows = await fetch("""
+    overview_task = fetch("""
         SELECT
             COUNT(*) AS total_listens,
             COUNT(DISTINCT raw_title || '|||' || raw_artist) AS unique_tracks,
@@ -366,15 +379,31 @@ async def summary(_=Depends(verify_key)):
             COUNT(DISTINCT platform) AS platform_count
         FROM listen_events
     """)
-    platform_breakdown = await fetch("""
+    platform_task = fetch("""
         SELECT platform, source_system, COUNT(*) AS count
         FROM listen_events
         GROUP BY platform, source_system
         ORDER BY count DESC
     """)
+    session_task = fetch("""
+        SELECT
+            COUNT(*) AS total_sessions,
+            COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
+            COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions,
+            COUNT(DISTINCT raw_artist) AS session_artists,
+            COUNT(DISTINCT raw_album) AS session_albums,
+            ROUND(AVG(completion)::numeric, 2) AS avg_completion,
+            MIN(session_start) AS earliest_session,
+            MAX(session_start) AS latest_session
+        FROM album_sessions
+    """)
+    rows, platform_breakdown, session_stats = await asyncio.gather(
+        overview_task, platform_task, session_task
+    )
     return {
         "overview": rows[0] if rows else {},
         "platform_breakdown": platform_breakdown,
+        "sessions": session_stats[0] if session_stats else {},
     }
 
 
@@ -392,21 +421,30 @@ async def top_artists(
     _=Depends(verify_key),
 ):
     df = _df(start_date, end_date, days, limit)
-    clauses, params = df.build_where()
+    clauses, params = df.build_where(col="e.listened_at")
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     idx = len(params) + 1
 
     rows = await fetch(f"""
         SELECT
-            raw_artist,
+            e.raw_artist,
             COUNT(*) AS listen_count,
-            COUNT(DISTINCT raw_title) AS unique_tracks,
-            COUNT(DISTINCT raw_album) FILTER (WHERE raw_album IS NOT NULL) AS unique_albums,
-            MIN(listened_at) AS first_listen,
-            MAX(listened_at) AS last_listen
-        FROM listen_events
+            COUNT(DISTINCT e.raw_title) AS unique_tracks,
+            COUNT(DISTINCT e.raw_album) FILTER (WHERE e.raw_album IS NOT NULL) AS unique_albums,
+            MIN(e.listened_at) AS first_listen,
+            MAX(e.listened_at) AS last_listen,
+            COALESCE(s.full_sessions, 0) AS full_sessions,
+            COALESCE(s.partial_sessions, 0) AS partial_sessions
+        FROM listen_events e
+        LEFT JOIN (
+            SELECT raw_artist,
+                   COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
+                   COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
+            FROM album_sessions
+            GROUP BY raw_artist
+        ) s ON LOWER(s.raw_artist) = LOWER(e.raw_artist)
         {where}
-        GROUP BY raw_artist
+        GROUP BY e.raw_artist, s.full_sessions, s.partial_sessions
         ORDER BY listen_count DESC
         LIMIT ${idx}
     """, *params, df.limit)
@@ -474,12 +512,12 @@ async def top_albums(
     _=Depends(verify_key),
 ):
     df = _df(start_date, end_date, days, limit)
-    clauses, params = df.build_where()
-    clauses.append("raw_album IS NOT NULL")
+    clauses, params = df.build_where(col="e.listened_at")
+    clauses.append("e.raw_album IS NOT NULL")
 
     if artist:
         idx = len(params) + 1
-        clauses.append(f"LOWER(raw_artist) = LOWER(${idx})")
+        clauses.append(f"LOWER(e.raw_artist) = LOWER(${idx})")
         params.append(artist)
 
     where = "WHERE " + " AND ".join(clauses)
@@ -487,15 +525,25 @@ async def top_albums(
 
     rows = await fetch(f"""
         SELECT
-            raw_album,
-            raw_artist,
+            e.raw_album,
+            e.raw_artist,
             COUNT(*) AS listen_count,
-            COUNT(DISTINCT raw_title) AS unique_tracks,
-            MIN(listened_at) AS first_listen,
-            MAX(listened_at) AS last_listen
-        FROM listen_events
+            COUNT(DISTINCT e.raw_title) AS unique_tracks,
+            MIN(e.listened_at) AS first_listen,
+            MAX(e.listened_at) AS last_listen,
+            COALESCE(s.full_sessions, 0) AS full_sessions,
+            COALESCE(s.partial_sessions, 0) AS partial_sessions
+        FROM listen_events e
+        LEFT JOIN (
+            SELECT raw_artist, raw_album,
+                   COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
+                   COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
+            FROM album_sessions
+            GROUP BY raw_artist, raw_album
+        ) s ON LOWER(s.raw_artist) = LOWER(e.raw_artist)
+           AND LOWER(s.raw_album) = LOWER(e.raw_album)
         {where}
-        GROUP BY raw_album, raw_artist
+        GROUP BY e.raw_album, e.raw_artist, s.full_sessions, s.partial_sessions
         ORDER BY listen_count DESC
         LIMIT ${idx}
     """, *params, df.limit)
@@ -520,7 +568,10 @@ async def timeline(
     clauses, params = df.build_where()
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
-    rows = await fetch(f"""
+    session_clauses, session_params = df.build_where(col="session_start")
+    session_where = ("WHERE " + " AND ".join(session_clauses)) if session_clauses else ""
+
+    listen_task = fetch(f"""
         SELECT
             DATE_TRUNC('{granularity}', listened_at) AS period,
             COUNT(*) AS listen_count,
@@ -531,6 +582,29 @@ async def timeline(
         GROUP BY period
         ORDER BY period
     """, *params)
+
+    session_task = fetch(f"""
+        SELECT
+            DATE_TRUNC('{granularity}', session_start) AS period,
+            COUNT(*) AS total_sessions,
+            COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
+            COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
+        FROM album_sessions
+        {session_where}
+        GROUP BY period
+        ORDER BY period
+    """, *session_params)
+
+    rows, session_rows = await asyncio.gather(listen_task, session_task)
+
+    # Merge session counts into timeline rows by period
+    session_map = {r["period"]: r for r in session_rows}
+    for row in rows:
+        s = session_map.get(row["period"], {})
+        row["full_sessions"] = s.get("full_sessions", 0)
+        row["partial_sessions"] = s.get("partial_sessions", 0)
+        row["total_sessions"] = s.get("total_sessions", 0)
+
     return {"timeline": rows, "granularity": granularity, "filters": df.as_dict()}
 
 
@@ -562,7 +636,7 @@ async def recent(
 
 @app.get("/api/artist/{artist_name}")
 async def artist_detail(artist_name: str, _=Depends(verify_key)):
-    listens = await fetch("""
+    listens_task = fetch("""
         SELECT COUNT(*) AS total_listens,
                COUNT(DISTINCT raw_title) AS unique_tracks,
                COUNT(DISTINCT raw_album) FILTER (WHERE raw_album IS NOT NULL) AS unique_albums,
@@ -572,7 +646,7 @@ async def artist_detail(artist_name: str, _=Depends(verify_key)):
         WHERE LOWER(raw_artist) = LOWER($1)
     """, artist_name)
 
-    top_tracks = await fetch("""
+    top_tracks_task = fetch("""
         SELECT raw_title, raw_album, COUNT(*) AS listen_count
         FROM listen_events
         WHERE LOWER(raw_artist) = LOWER($1)
@@ -581,7 +655,7 @@ async def artist_detail(artist_name: str, _=Depends(verify_key)):
         LIMIT 20
     """, artist_name)
 
-    by_year = await fetch("""
+    by_year_task = fetch("""
         SELECT EXTRACT(YEAR FROM listened_at)::int AS year,
                COUNT(*) AS listen_count
         FROM listen_events
@@ -590,11 +664,38 @@ async def artist_detail(artist_name: str, _=Depends(verify_key)):
         ORDER BY year
     """, artist_name)
 
+    sessions_task = fetch("""
+        SELECT raw_album, session_start, session_end,
+               tracks_played, total_tracks, completion,
+               session_type, release_type
+        FROM album_sessions
+        WHERE LOWER(raw_artist) = LOWER($1)
+        ORDER BY session_start DESC
+        LIMIT 50
+    """, artist_name)
+
+    session_summary_task = fetch("""
+        SELECT
+            COUNT(*) AS total_sessions,
+            COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
+            COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions,
+            COUNT(DISTINCT raw_album) AS albums_with_sessions,
+            ROUND(AVG(completion)::numeric, 2) AS avg_completion
+        FROM album_sessions
+        WHERE LOWER(raw_artist) = LOWER($1)
+    """, artist_name)
+
+    listens, top_tracks, by_year, sessions, session_summary = await asyncio.gather(
+        listens_task, top_tracks_task, by_year_task, sessions_task, session_summary_task
+    )
+
     return {
         "artist": artist_name,
         "stats": listens[0] if listens else {},
         "top_tracks": top_tracks,
         "by_year": by_year,
+        "session_summary": session_summary[0] if session_summary else {},
+        "recent_sessions": sessions,
     }
 
 
@@ -1862,12 +1963,23 @@ async def canonical_gaps(
             COUNT(clm.event_id)::int AS listen_count,
             COUNT(DISTINCT le.raw_title)::int AS unique_tracks,
             MIN(le.listened_at) AS first_listen,
-            MAX(le.listened_at) AS last_listen
+            MAX(le.listened_at) AS last_listen,
+            COALESCE(s.full_sessions, 0) AS full_sessions,
+            COALESCE(s.partial_sessions, 0) AS partial_sessions
         FROM canonical_albums ca
         LEFT JOIN canonical_listen_matches clm ON clm.canonical_id = ca.id
         LEFT JOIN listen_events le ON le.event_id = clm.event_id
+        LEFT JOIN (
+            SELECT raw_artist, raw_album,
+                   COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
+                   COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
+            FROM album_sessions
+            GROUP BY raw_artist, raw_album
+        ) s ON LOWER(s.raw_artist) = LOWER(ca.artist)
+           AND LOWER(s.raw_album) = LOWER(ca.album)
         {where}
-        GROUP BY ca.id, ca.artist, ca.album, ca.year, ca.genre, ca.subgenre, ca.tier, ca.description
+        GROUP BY ca.id, ca.artist, ca.album, ca.year, ca.genre, ca.subgenre, ca.tier, ca.description,
+                 s.full_sessions, s.partial_sessions
         {having}
         ORDER BY
             COUNT(clm.event_id) ASC,
