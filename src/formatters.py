@@ -94,7 +94,7 @@ def compact_recent(rows: list[dict]) -> str:
 
 
 def compact_album_completion(rows: list[dict]) -> str:
-    """'Artist - Album: heard/total tracks (pct%)' one per line."""
+    """'Artist - Album: heard/total tracks (pct%) [Fs/Ps]' one per line."""
     lines = []
     for r in rows:
         artist = r.get("raw_artist", "?")
@@ -102,7 +102,10 @@ def compact_album_completion(rows: list[dict]) -> str:
         heard = r.get("tracks_heard", 0)
         total = r.get("total_tracks", 0)
         pct = round(r.get("completion", 0) * 100)
-        lines.append(f"{artist} - {album}: {heard}/{total} tracks ({pct}%)")
+        full = r.get("full_sessions", 0)
+        partial = r.get("partial_sessions", 0)
+        sess = f" [{full}f/{partial}p]" if full or partial else ""
+        lines.append(f"{artist} - {album}: {heard}/{total} tracks ({pct}%){sess}")
     return "\n".join(lines)
 
 

@@ -120,7 +120,7 @@ SCHEMA = {
         {
             "route": "/api/artist/{artist_name}",
             "method": "GET",
-            "description": "Detailed stats for a specific artist: total listens, top tracks, yearly breakdown, session summary (full/partial counts), recent album sessions",
+            "description": "One-stop artist deep dive: total listens, top tracks, yearly breakdown, per-album completion with session counts, session summary, recent sessions. Eliminates need for separate /api/album-completion?artist= call.",
             "params": {
                 "artist_name": {"type": "string", "required": True, "location": "path"},
             },
@@ -129,7 +129,7 @@ SCHEMA = {
         {
             "route": "/api/album-completion",
             "method": "GET",
-            "description": "All-time tracklist coverage per album — counts how many distinct tracks have EVER been played, regardless of when. NOT time-sensitive: playing 1 track/month for a year counts the same as playing the whole album in one sitting. Use /api/album-sessions instead for actual full album listens in a single sitting.",
+            "description": "All-time tracklist coverage per album with session counts — counts how many distinct tracks have EVER been played, plus full/partial album session counts. Single query (no N+1). Use for 'what tracks am I missing', 'finish' and 'disco' modes. Session data included inline eliminates need to cross-reference /api/album-sessions.",
             "params": {
                 "artist": {"type": "string", "required": False},
                 "start_date": {"type": "ISO date string", "required": False},
@@ -169,6 +169,18 @@ SCHEMA = {
                 "days": {"type": "int", "required": False},
                 "session_type": {"type": "string", "required": False, "enum": ["full", "partial"]},
                 "release_type": {"type": "string", "required": False, "enum": ["Album", "EP", "Single"], "description": "Filter by MusicBrainz release type"},
+            },
+            "auth": True,
+        },
+        {
+            "route": "/api/revisit-candidates",
+            "method": "GET",
+            "description": "Albums listened to heavily but not played in N months — the 'loved then abandoned' list. Includes completion stats and session counts. Use for revisit mode instead of raw SQL.",
+            "params": {
+                "min_listens": {"type": "int", "required": False, "default": 10, "description": "Minimum total plays to qualify"},
+                "months_ago": {"type": "int", "required": False, "default": 6, "description": "Months since last listen (1-60)"},
+                "limit": {"type": "int", "required": False, "default": 20, "max": 200},
+                "format": {"type": "string", "required": False, "default": "compact", "enum": ["compact", "json"]},
             },
             "auth": True,
         },

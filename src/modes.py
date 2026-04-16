@@ -15,8 +15,8 @@ Albums with 3+ tracks heard, under 80% completion, never fully completed.
 Prioritize albums where the user had identifiable partial sessions (actively sat down and stopped).
 
 API Action:
-/api/album-completion min_completion=0.25 max_completion=0.79, sort by completion desc.
-Cross-reference /api/album-sessions?session_type=partial for abandoned mid-listen sessions — these are higher priority.
+/api/album-completion?min_completion=0.25&max_completion=0.79&format=json — returns albums with completion stats AND session counts (full/partial) inline. No cross-referencing needed.
+Prioritize albums with partial_sessions > 0 (user actively sat down and stopped) over those with zero sessions.
 
 Source Action:
 Search AOTY and RYM for the album's rating. Prioritize the most critically acclaimed unfinished albums.
@@ -35,8 +35,7 @@ Pick a high-play artist (500+ plays) and find their albums the user has barely t
 
 API Action:
 /api/top-artists?limit=20 to identify high-play artists.
-/api/album-completion?artist=[name] for per-album coverage.
-/api/top-tracks?artist=[name] to understand if user cherry-picked singles or explored deep cuts.
+/api/artist/[name] — single call gives top tracks, per-album completion with session counts, and yearly breakdown. No need for separate album-completion or top-tracks calls.
 
 Source Action:
 Search RYM for the artist's discography page — community rankings of each album.
@@ -239,13 +238,8 @@ Mode: revisit
 Albums the user listened to heavily in the past but hasn't played in 6+ months. Things that might hit differently now.
 
 API Action:
-Use /api/album-sessions?session_type=full for albums with completed listens.
-Cross-reference /api/album-completion for total play depth.
-Use /api/query with SQL:
-SELECT raw_artist, raw_album, COUNT(*) as plays, MAX(listened_at) as last_played
-FROM listen_events GROUP BY raw_artist, raw_album
-HAVING COUNT(*) >= 10 AND MAX(listened_at) < NOW() - INTERVAL '6 months'
-ORDER BY plays DESC.
+/api/revisit-candidates?min_listens=10&months_ago=6 — returns albums with heavy play history but no recent listens, pre-sorted by total plays. Includes completion stats and session counts (full/partial).
+For deeper context on the top candidate: /api/artist/{name} for full discography view with sessions.
 
 Source Action:
 Search for recent retrospective coverage, anniversary features, or reappraisals.

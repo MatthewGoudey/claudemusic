@@ -685,8 +685,39 @@ async def artist_detail(artist_name: str, _=Depends(verify_key)):
         WHERE LOWER(raw_artist) = LOWER($1)
     """, artist_name)
 
-    listens, top_tracks, by_year, sessions, session_summary = await asyncio.gather(
-        listens_task, top_tracks_task, by_year_task, sessions_task, session_summary_task
+    albums_task = fetch("""
+        SELECT
+            le.raw_album,
+            COUNT(DISTINCT le.raw_title)::int AS tracks_heard,
+            COALESCE(at.track_count, 0) AS total_tracks,
+            CASE WHEN at.track_count > 0
+                 THEN ROUND(COUNT(DISTINCT le.raw_title)::numeric / at.track_count, 2)
+                 ELSE 0.0 END AS completion,
+            COUNT(*)::int AS listen_count,
+            MAX(le.listened_at) AS last_listen,
+            COALESCE(at.release_type, 'unknown') AS release_type,
+            COALESCE(s.full_sessions, 0)::int AS full_sessions,
+            COALESCE(s.partial_sessions, 0)::int AS partial_sessions
+        FROM listen_events le
+        LEFT JOIN album_tracklist at
+            ON LOWER(at.raw_artist) = LOWER(le.raw_artist)
+            AND LOWER(at.raw_album) = LOWER(le.raw_album)
+        LEFT JOIN (
+            SELECT raw_artist, raw_album,
+                   COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
+                   COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
+            FROM album_sessions
+            GROUP BY raw_artist, raw_album
+        ) s ON LOWER(s.raw_artist) = LOWER(le.raw_artist)
+           AND LOWER(s.raw_album) = LOWER(le.raw_album)
+        WHERE LOWER(le.raw_artist) = LOWER($1)
+          AND le.raw_album IS NOT NULL
+        GROUP BY le.raw_album, at.track_count, at.release_type, s.full_sessions, s.partial_sessions
+        ORDER BY listen_count DESC
+    """, artist_name)
+
+    listens, top_tracks, by_year, sessions, session_summary, albums = await asyncio.gather(
+        listens_task, top_tracks_task, by_year_task, sessions_task, session_summary_task, albums_task
     )
 
     return {
@@ -694,6 +725,7 @@ async def artist_detail(artist_name: str, _=Depends(verify_key)):
         "stats": listens[0] if listens else {},
         "top_tracks": top_tracks,
         "by_year": by_year,
+        "albums": albums,
         "session_summary": session_summary[0] if session_summary else {},
         "recent_sessions": sessions,
     }
@@ -716,7 +748,7 @@ async def album_completion(
     _=Depends(verify_key),
 ):
     df = _df(start_date, end_date, days, limit)
-    clauses, params = df.build_where()
+    clauses, params = df.build_where(col="le.listened_at")
     clauses.append("le.raw_album IS NOT NULL")
 
     if artist:
@@ -726,53 +758,61 @@ async def album_completion(
 
     where = "WHERE " + " AND ".join(clauses)
 
-    # Get distinct albums with their heard tracks and listen counts
-    albums = await fetch(f"""
+    # Build completion filter as HAVING clauses
+    having_clauses = []
+    if min_completion is not None:
+        idx = len(params) + 1
+        having_clauses.append(f"ROUND(COUNT(DISTINCT le.raw_title)::numeric / at.track_count, 2) >= ${idx}")
+        params.append(min_completion)
+    if max_completion is not None:
+        idx = len(params) + 1
+        having_clauses.append(f"ROUND(COUNT(DISTINCT le.raw_title)::numeric / at.track_count, 2) <= ${idx}")
+        params.append(max_completion)
+    having = ("HAVING " + " AND ".join(having_clauses)) if having_clauses else ""
+
+    idx = len(params) + 1
+
+    # Single query: JOIN album_tracklist for track counts + album_sessions for session counts
+    rows = await fetch(f"""
         SELECT
             le.raw_artist,
             le.raw_album,
-            COUNT(DISTINCT le.raw_title) AS tracks_heard,
-            COUNT(*) AS total_listens,
+            COUNT(DISTINCT le.raw_title)::int AS tracks_heard,
+            at.track_count AS total_tracks,
+            ROUND(COUNT(DISTINCT le.raw_title)::numeric / at.track_count, 2) AS completion,
+            COUNT(*)::int AS total_listens,
             MIN(le.listened_at) AS first_listen,
-            MAX(le.listened_at) AS last_listen
+            MAX(le.listened_at) AS last_listen,
+            COALESCE(at.release_type, 'unknown') AS release_type,
+            CASE WHEN at.source IS NOT NULL THEN at.source ELSE 'heuristic' END AS tracklist_source,
+            COALESCE(s.full_sessions, 0)::int AS full_sessions,
+            COALESCE(s.partial_sessions, 0)::int AS partial_sessions
         FROM listen_events le
+        JOIN album_tracklist at
+            ON LOWER(at.raw_artist) = LOWER(le.raw_artist)
+            AND LOWER(at.raw_album) = LOWER(le.raw_album)
+            AND at.track_count > 0
+            AND COALESCE(at.quality_flag, '') != 'box_set_suspect'
+        LEFT JOIN (
+            SELECT raw_artist, raw_album,
+                   COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
+                   COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
+            FROM album_sessions
+            GROUP BY raw_artist, raw_album
+        ) s ON LOWER(s.raw_artist) = LOWER(le.raw_artist)
+           AND LOWER(s.raw_album) = LOWER(le.raw_album)
         {where}
-        GROUP BY le.raw_artist, le.raw_album
+        GROUP BY le.raw_artist, le.raw_album, at.track_count, at.release_type, at.source,
+                 s.full_sessions, s.partial_sessions
+        {having}
         ORDER BY total_listens DESC
-    """, *params)
-
-    results = []
-    for album in albums:
-        total_tracks, source, _ = await _get_album_track_info(album["raw_artist"], album["raw_album"])
-        if total_tracks == 0:
-            continue
-
-        completion = round(album["tracks_heard"] / total_tracks, 2)
-
-        if min_completion is not None and completion < min_completion:
-            continue
-        if max_completion is not None and completion > max_completion:
-            continue
-
-        results.append({
-            "raw_artist": album["raw_artist"],
-            "raw_album": album["raw_album"],
-            "tracks_heard": album["tracks_heard"],
-            "total_tracks": total_tracks,
-            "completion": completion,
-            "total_listens": album["total_listens"],
-            "first_listen": album["first_listen"].isoformat() if album["first_listen"] else None,
-            "last_listen": album["last_listen"].isoformat() if album["last_listen"] else None,
-            "tracklist_source": source,
-        })
-
-        if len(results) >= df.limit:
-            break
+        LIMIT ${idx}
+    """, *params, df.limit)
 
     if format == "compact":
-        return PlainTextResponse(compact_album_completion(results))
+        return PlainTextResponse(compact_album_completion(rows))
     return {
-        "albums": results,
+        "albums": rows,
         "filters": {
             **df.as_dict(),
             "artist": artist,
@@ -918,6 +958,80 @@ async def album_sessions_stats(
             "session_type": session_type,
             "release_type": release_type,
         },
+    }
+
+
+# ============================================================
+# Revisit candidates
+# ============================================================
+
+@app.get("/api/revisit-candidates")
+async def revisit_candidates(
+    min_listens: int = Query(default=10, ge=1),
+    months_ago: int = Query(default=6, ge=1, le=60),
+    limit: int = Query(default=20, le=200),
+    format: str = Query(default="compact", pattern="^(compact|json)$"),
+    _=Depends(verify_key),
+):
+    """
+    Albums listened to heavily in the past but not played in N months.
+    Includes session data and completion stats for context.
+    Sorted by total listens descending — the most-loved abandoned albums first.
+    """
+    rows = await fetch("""
+        SELECT
+            le.raw_artist,
+            le.raw_album,
+            COUNT(*)::int AS total_listens,
+            COUNT(DISTINCT le.raw_title)::int AS tracks_heard,
+            COALESCE(at.track_count, 0) AS total_tracks,
+            CASE WHEN at.track_count > 0
+                 THEN ROUND(COUNT(DISTINCT le.raw_title)::numeric / at.track_count, 2)
+                 ELSE 0.0 END AS completion,
+            MIN(le.listened_at) AS first_listen,
+            MAX(le.listened_at) AS last_listen,
+            COALESCE(at.release_type, 'unknown') AS release_type,
+            COALESCE(s.full_sessions, 0)::int AS full_sessions,
+            COALESCE(s.partial_sessions, 0)::int AS partial_sessions
+        FROM listen_events le
+        LEFT JOIN album_tracklist at
+            ON LOWER(at.raw_artist) = LOWER(le.raw_artist)
+            AND LOWER(at.raw_album) = LOWER(le.raw_album)
+        LEFT JOIN (
+            SELECT raw_artist, raw_album,
+                   COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
+                   COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
+            FROM album_sessions
+            GROUP BY raw_artist, raw_album
+        ) s ON LOWER(s.raw_artist) = LOWER(le.raw_artist)
+           AND LOWER(s.raw_album) = LOWER(le.raw_album)
+        WHERE le.raw_album IS NOT NULL
+        GROUP BY le.raw_artist, le.raw_album, at.track_count, at.release_type,
+                 s.full_sessions, s.partial_sessions
+        HAVING COUNT(*) >= $1
+           AND MAX(le.listened_at) < NOW() - MAKE_INTERVAL(months => $2)
+        ORDER BY COUNT(*) DESC
+        LIMIT $3
+    """, min_listens, months_ago, limit)
+
+    if format == "compact":
+        lines = []
+        for r in rows:
+            artist = r.get("raw_artist", "?")
+            album = r.get("raw_album", "?")
+            plays = r.get("total_listens", 0)
+            last = r.get("last_listen")
+            last_str = _fmt_ts(last) if last else ""
+            full = r.get("full_sessions", 0)
+            partial = r.get("partial_sessions", 0)
+            sess = f", {full}f/{partial}p sessions" if full or partial else ""
+            lines.append(f"{artist} - {album}: {plays} plays, last heard {last_str}{sess}")
+        return PlainTextResponse("\n".join(lines))
+
+    return {
+        "candidates": rows,
+        "count": len(rows),
+        "filters": {"min_listens": min_listens, "months_ago": months_ago},
     }
 
 
