@@ -1931,6 +1931,7 @@ async def list_canonical(
     subgenre: Optional[str] = None,
     tier: Optional[str] = None,
     artist: Optional[str] = None,
+    tag: Optional[str] = None,
     limit: int = Query(default=50, le=1000),
     offset: int = Query(default=0, ge=0),
     format: str = Query(default="compact", pattern="^(compact|json)$"),
@@ -1941,16 +1942,21 @@ async def list_canonical(
 
     if genre:
         params.append(genre)
-        clauses.append(f"LOWER(genre) = LOWER(${len(params)})")
+        clauses.append(f"LOWER(ca.genre) = LOWER(${len(params)})")
     if subgenre:
         params.append(subgenre)
-        clauses.append(f"LOWER(subgenre) = LOWER(${len(params)})")
+        clauses.append(f"LOWER(ca.subgenre) = LOWER(${len(params)})")
     if tier:
         params.append(tier)
-        clauses.append(f"tier = ${len(params)}")
+        clauses.append(f"ca.tier = ${len(params)}")
     if artist:
         params.append(f"%{artist}%")
-        clauses.append(f"LOWER(artist) LIKE LOWER(${len(params)})")
+        clauses.append(f"LOWER(ca.artist) LIKE LOWER(${len(params)})")
+
+    tag_join = ""
+    if tag:
+        params.append(f"%{tag}%")
+        tag_join = f"JOIN artist_tags agt ON agt.norm_artist = normalize_artist(ca.artist) AND LOWER(agt.tag) LIKE LOWER(${len(params)})"
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     params.extend([limit, offset])
@@ -1958,10 +1964,11 @@ async def list_canonical(
     offset_idx = len(params)
 
     rows = await fetch(f"""
-        SELECT id, artist, album, year, genre, subgenre, tier, description, added_at
-        FROM canonical_albums
+        SELECT DISTINCT ca.id, ca.artist, ca.album, ca.year, ca.genre, ca.subgenre, ca.tier, ca.description, ca.added_at
+        FROM canonical_albums ca
+        {tag_join}
         {where}
-        ORDER BY genre, tier, year NULLS LAST
+        ORDER BY ca.genre, ca.tier, ca.year NULLS LAST
         LIMIT ${limit_idx} OFFSET ${offset_idx}
     """, *params)
 
@@ -2091,6 +2098,7 @@ async def canonical_gaps(
     genre: Optional[str] = None,
     subgenre: Optional[str] = None,
     tier: Optional[str] = None,
+    tag: Optional[str] = None,
     heard: Optional[str] = Query(default=None, pattern="^(true|false)$"),
     limit: int = Query(default=100, le=1000),
     offset: int = Query(default=0, ge=0),
@@ -2109,6 +2117,11 @@ async def canonical_gaps(
     if tier:
         params.append(tier)
         clauses.append(f"ca.tier = ${len(params)}")
+
+    tag_join = ""
+    if tag:
+        params.append(f"%{tag}%")
+        tag_join = f"JOIN artist_tags agt ON agt.norm_artist = normalize_artist(ca.artist) AND LOWER(agt.tag) LIKE LOWER(${len(params)})"
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
@@ -2140,6 +2153,7 @@ async def canonical_gaps(
             COALESCE(s.full_sessions, 0) AS full_sessions,
             COALESCE(s.partial_sessions, 0) AS partial_sessions
         FROM canonical_albums ca
+        {tag_join}
         LEFT JOIN canonical_listen_matches clm ON clm.canonical_id = ca.id
         LEFT JOIN listen_events le ON le.event_id = clm.event_id
         LEFT JOIN (
@@ -2199,6 +2213,7 @@ async def checklist(
     source: Optional[str] = None,
     heard: Optional[str] = Query(default=None, pattern="^(true|false)$"),
     artist: Optional[str] = None,
+    tag: Optional[str] = None,
     year_min: Optional[int] = None,
     year_max: Optional[int] = None,
     sort: str = Query(default="priority", pattern="^(priority|year|artist|recent)$"),
@@ -2223,6 +2238,11 @@ async def checklist(
     if year_max:
         params.append(year_max)
         clauses.append(f"ca.year <= ${len(params)}")
+
+    tag_join = ""
+    if tag:
+        params.append(f"%{tag}%")
+        tag_join = f"JOIN artist_tags agt ON agt.norm_artist = normalize_artist(ca.artist) AND LOWER(agt.tag) LIKE LOWER(${len(params)})"
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
@@ -2261,6 +2281,7 @@ async def checklist(
             SUM(1.0 / COALESCE(cs.rank, 500)) AS priority
         FROM checklist_albums ca
         JOIN checklist_sources cs ON cs.checklist_id = ca.id
+        {tag_join}
         LEFT JOIN checklist_listen_matches clm ON clm.checklist_id = ca.id
         LEFT JOIN listen_events le ON le.event_id = clm.event_id
         LEFT JOIN album_tracklist at
@@ -2326,6 +2347,7 @@ async def checklist(
 async def checklist_gaps(
     source: Optional[str] = None,
     artist: Optional[str] = None,
+    tag: Optional[str] = None,
     year_min: Optional[int] = None,
     year_max: Optional[int] = None,
     limit: int = Query(default=50, le=500),
@@ -2350,6 +2372,11 @@ async def checklist_gaps(
         params.append(year_max)
         clauses.append(f"ca.year <= ${len(params)}")
 
+    tag_join = ""
+    if tag:
+        params.append(f"%{tag}%")
+        tag_join = f"JOIN artist_tags agt ON agt.norm_artist = normalize_artist(ca.artist) AND LOWER(agt.tag) LIKE LOWER(${len(params)})"
+
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     params.extend([limit, offset])
     limit_idx = len(params) - 1
@@ -2361,6 +2388,7 @@ async def checklist_gaps(
             SUM(1.0 / COALESCE(cs.rank, 500)) AS priority
         FROM checklist_albums ca
         JOIN checklist_sources cs ON cs.checklist_id = ca.id
+        {tag_join}
         LEFT JOIN checklist_listen_matches clm ON clm.checklist_id = ca.id
         {where}
         GROUP BY ca.id, ca.artist, ca.album, ca.year
@@ -2399,6 +2427,38 @@ async def checklist_gaps(
         "source": source, "artist": artist,
         "year_min": year_min, "year_max": year_max,
     }}
+
+
+@app.get("/api/checklist/tags")
+async def checklist_tags(
+    source: Optional[str] = None,
+    limit: int = Query(default=50, le=200),
+    _=Depends(verify_key),
+):
+    """Most common Last.fm tags across checklist album artists.
+    Use these tag names with the ?tag= filter on /checklist, /checklist/gaps, /canonical, /canonical/gaps.
+    """
+    clauses = []
+    params = []
+    source_join = ""
+    if source:
+        params.append(source)
+        source_join = f"JOIN checklist_sources cs ON cs.checklist_id = ca.id AND cs.source = ${len(params)}"
+
+    params.append(limit)
+    limit_idx = len(params)
+
+    rows = await fetch(f"""
+        SELECT agt.tag, COUNT(DISTINCT ca.id) AS album_count
+        FROM checklist_albums ca
+        {source_join}
+        JOIN artist_tags agt ON agt.norm_artist = normalize_artist(ca.artist)
+        GROUP BY agt.tag
+        ORDER BY album_count DESC
+        LIMIT ${limit_idx}
+    """, *params)
+
+    return {"tags": rows, "count": len(rows), "filters": {"source": source}}
 
 
 @app.get("/api/checklist/stats")
