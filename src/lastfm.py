@@ -139,3 +139,55 @@ async def resolve_missing_via_lastfm(limit: int = 500) -> dict:
         "failed": failed,
         "failures": failures[:50],
     }
+
+
+async def resolve_checklist_missing_lastfm(limit: int = 2000) -> dict:
+    """Resolve checklist albums that aren't in album_tracklist using Last.fm."""
+    if not LASTFM_API_KEY:
+        return {"error": "LASTFM_API_KEY not set"}
+
+    unresolved = await fetch("""
+        SELECT ca.artist AS raw_artist, ca.album AS raw_album
+        FROM checklist_albums ca
+        LEFT JOIN album_tracklist at
+            ON LOWER(at.raw_artist) = LOWER(ca.artist)
+            AND LOWER(at.raw_album) = LOWER(ca.album)
+        WHERE at.raw_artist IS NULL
+        ORDER BY ca.artist, ca.album
+        LIMIT $1
+    """, limit)
+
+    resolved = 0
+    failed = 0
+    failures = []
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        for row in unresolved:
+            artist = row["raw_artist"]
+            album = row["raw_album"]
+
+            await asyncio.sleep(0.25)
+            result = await resolve_album_lastfm(client, artist, album)
+
+            if result is not None:
+                track_count, release_type = result
+                await execute(
+                    """INSERT INTO album_tracklist (raw_artist, raw_album, track_count, release_type, source, resolved_at)
+                       VALUES ($1, $2, $3, $4, 'lastfm', $5)
+                       ON CONFLICT (raw_artist, raw_album)
+                       DO UPDATE SET track_count = $3, release_type = $4, source = 'lastfm', resolved_at = $5""",
+                    artist, album, track_count, release_type, datetime.now(timezone.utc),
+                )
+                resolved += 1
+                logger.info(f"Checklist Last.fm resolved: {artist} - {album} ({track_count} tracks, {release_type})")
+            else:
+                failed += 1
+                failures.append({"raw_artist": artist, "raw_album": album})
+
+    return {
+        "source": "lastfm_checklist",
+        "total_unresolved": len(unresolved),
+        "resolved": resolved,
+        "failed": failed,
+        "failures": failures[:50],
+    }

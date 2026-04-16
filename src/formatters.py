@@ -248,3 +248,48 @@ def compact_canonical_gaps(rows: list[dict]) -> str:
     if heard:
         sections.append("HEARD:\n" + "\n".join(heard))
     return "\n\n".join(sections)
+
+
+def _source_tags(sources: list[dict]) -> str:
+    """Format source list as compact tags: [RS#1, 1001#42, AOTY]."""
+    tags = []
+    abbrev = {"rolling_stone_500": "RS", "1001_albums": "1001", "aoty": "AOTY", "canonical": "Canon", "manual": "Manual"}
+    for s in sources:
+        name = abbrev.get(s.get("source", ""), s.get("source", "?"))
+        rank = s.get("rank")
+        tags.append(f"{name}#{rank}" if rank else name)
+    return "[" + ", ".join(tags) + "]" if tags else ""
+
+
+def compact_checklist(rows: list[dict]) -> str:
+    """'Artist - Album (year) [RS#1, 1001#42] — 47 plays, 3f/1p' one per line."""
+    lines = []
+    for r in rows:
+        artist = r.get("artist", "?")
+        album = r.get("album", "?")
+        year = r.get("year")
+        year_str = f" ({year})" if year else ""
+        src = _source_tags(r.get("sources", []))
+        listen_count = r.get("listen_count", 0)
+        full = r.get("full_sessions", 0)
+        partial = r.get("partial_sessions", 0)
+        if listen_count > 0:
+            sess = f", {full}f/{partial}p" if full or partial else ""
+            stats = f" — {listen_count} plays{sess}"
+        else:
+            stats = " — unheard"
+        lines.append(f"{artist} - {album}{year_str} {src}{stats}")
+    return "\n".join(lines)
+
+
+def compact_checklist_gaps(rows: list[dict]) -> str:
+    """Unheard checklist albums with source tags."""
+    lines = []
+    for r in rows:
+        artist = r.get("artist", "?")
+        album = r.get("album", "?")
+        year = r.get("year")
+        year_str = f" ({year})" if year else ""
+        src = _source_tags(r.get("sources", []))
+        lines.append(f"{artist} - {album}{year_str} {src}")
+    return "\n".join(lines)

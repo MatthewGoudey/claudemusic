@@ -17,8 +17,8 @@ from pydantic import BaseModel
 from src.database import get_pool, get_ro_pool, close_pools, fetch, fetchrow, fetchval, fetch_ro, execute
 from src.auth import verify_key
 from src.filters import parse_date_filter, DateFilter
-from src.musicbrainz import resolve_single, resolve_all_missing, get_resolution_status, audit_and_reresolve
-from src.lastfm import resolve_missing_via_lastfm
+from src.musicbrainz import resolve_single, resolve_all_missing, get_resolution_status, audit_and_reresolve, resolve_checklist_missing
+from src.lastfm import resolve_missing_via_lastfm, resolve_checklist_missing_lastfm
 from src.schema_registry import SCHEMA
 from src.modes import MODES
 from src.genres import CANONICAL_GENRES, CANONICAL_GENRE_SET, CANONICAL_GENRE_LOWER
@@ -101,6 +101,42 @@ async def startup():
                 listens_365d  INTEGER NOT NULL DEFAULT 0,
                 top_album     TEXT,
                 computed_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        # Ensure normalize_album function exists (used by checklist + canonical matching)
+        await conn.execute("""
+            CREATE OR REPLACE FUNCTION normalize_album(name TEXT) RETURNS TEXT AS $$
+                SELECT TRIM(REGEXP_REPLACE(
+                    REGEXP_REPLACE(
+                        LOWER(name),
+                        '\\s*\\(([^)]*(?:deluxe|remaster|expanded|anniversary|bonus|special|edition|version|explicit|clean|mono|stereo|original)[^)]*)\\)',
+                        '', 'gi'
+                    ),
+                    '[^a-z0-9\\s]', '', 'g'
+                ))
+            $$ LANGUAGE SQL IMMUTABLE
+        """)
+        await conn.execute("""
+            CREATE OR REPLACE FUNCTION normalize_album_loose(name TEXT) RETURNS TEXT AS $$
+                SELECT TRIM(REGEXP_REPLACE(
+                    REGEXP_REPLACE(
+                        LOWER(name),
+                        '\\s*\\([^)]*\\)', '', 'g'
+                    ),
+                    '[^a-z0-9\\s]', '', 'g'
+                ))
+            $$ LANGUAGE SQL IMMUTABLE
+        """)
+        # Ensure checklist tables exist
+        for sql_file in ["checklist_albums.sql", "checklist_sources.sql", "checklist_listen_matches.sql"]:
+            sql_path = os.path.join(os.path.dirname(__file__), "sql", sql_file)
+            if os.path.exists(sql_path):
+                with open(sql_path) as f:
+                    await conn.execute(f.read())
+        # Create norm index after functions exist (idempotent via IF NOT EXISTS in SQL file)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_checklist_norm ON checklist_albums(
+                normalize_artist(artist), normalize_album(album)
             )
         """)
 
@@ -1833,6 +1869,29 @@ async def upsert_canonical(body: CanonicalBatchRequest, _=Depends(verify_key)):
                 description = EXCLUDED.description
         """, entry.artist, entry.album, entry.year, entry.genre,
             entry.subgenre, entry.tier, entry.description)
+
+        # Sync to checklist tables
+        row = await fetchrow(
+            """INSERT INTO checklist_albums (artist, album, year)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (artist, album) DO NOTHING
+               RETURNING id""",
+            entry.artist, entry.album, entry.year,
+        )
+        cid = row["id"] if row else await fetchval(
+            "SELECT id FROM checklist_albums WHERE artist = $1 AND album = $2",
+            entry.artist, entry.album,
+        )
+        if cid:
+            await execute(
+                """INSERT INTO checklist_sources (checklist_id, source, genre, subgenre, tier, description)
+                   VALUES ($1, 'canonical', $2, $3, $4, $5)
+                   ON CONFLICT (checklist_id, source) DO UPDATE SET
+                       genre = EXCLUDED.genre, subgenre = EXCLUDED.subgenre,
+                       tier = EXCLUDED.tier, description = EXCLUDED.description""",
+                cid, entry.genre, entry.subgenre, entry.tier, entry.description,
+            )
+
         count += 1
 
     return {"upserted": count}
@@ -2122,6 +2181,387 @@ async def canonical_gaps(
         "albums": results,
         "count": len(results),
         "filters": {"genre": genre, "subgenre": subgenre, "tier": tier, "heard": heard},
+    }
+
+
+# ============================================================
+# Album Checklist (unified multi-source album tracker)
+# ============================================================
+
+
+class ChecklistAddRequest(BaseModel):
+    albums: list[dict]  # [{artist, album, year?}]
+    source: str = "manual"
+
+
+@app.get("/api/checklist")
+async def checklist(
+    source: Optional[str] = None,
+    heard: Optional[str] = Query(default=None, pattern="^(true|false)$"),
+    artist: Optional[str] = None,
+    year_min: Optional[int] = None,
+    year_max: Optional[int] = None,
+    sort: str = Query(default="priority", pattern="^(priority|year|artist|recent)$"),
+    limit: int = Query(default=50, le=500),
+    offset: int = Query(default=0, ge=0),
+    format: str = Query(default="compact", pattern="^(compact|json)$"),
+    _=Depends(verify_key),
+):
+    """Browse checklist albums with listen stats, session counts, and source info."""
+    clauses = []
+    params = []
+
+    if source:
+        params.append(source)
+        clauses.append(f"cs.source = ${len(params)}")
+    if artist:
+        params.append(f"%{artist}%")
+        clauses.append(f"LOWER(ca.artist) LIKE LOWER(${len(params)})")
+    if year_min:
+        params.append(year_min)
+        clauses.append(f"ca.year >= ${len(params)}")
+    if year_max:
+        params.append(year_max)
+        clauses.append(f"ca.year <= ${len(params)}")
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    # heard filter as HAVING
+    having = ""
+    if heard == "true":
+        having = "HAVING COUNT(clm.event_id) > 0"
+    elif heard == "false":
+        having = "HAVING COUNT(clm.event_id) = 0"
+
+    sort_map = {
+        "priority": "priority DESC, ca.year NULLS LAST",
+        "year": "ca.year NULLS LAST, ca.artist",
+        "artist": "ca.artist, ca.year NULLS LAST",
+        "recent": "MAX(le.listened_at) DESC NULLS LAST",
+    }
+    order = sort_map[sort]
+
+    params.extend([limit, offset])
+    limit_idx = len(params) - 1
+    offset_idx = len(params)
+
+    rows = await fetch(f"""
+        SELECT
+            ca.id, ca.artist, ca.album, ca.year,
+            COUNT(clm.event_id)::int AS listen_count,
+            COUNT(DISTINCT le.raw_title)::int AS unique_tracks,
+            MIN(le.listened_at) AS first_listen,
+            MAX(le.listened_at) AS last_listen,
+            COALESCE(at.track_count, 0) AS total_tracks,
+            CASE WHEN at.track_count > 0
+                 THEN ROUND(COUNT(DISTINCT le.raw_title)::numeric / at.track_count, 2)
+                 ELSE 0.0 END AS completion,
+            COALESCE(sess.full_sessions, 0)::int AS full_sessions,
+            COALESCE(sess.partial_sessions, 0)::int AS partial_sessions,
+            SUM(1.0 / COALESCE(cs.rank, 500)) AS priority
+        FROM checklist_albums ca
+        JOIN checklist_sources cs ON cs.checklist_id = ca.id
+        LEFT JOIN checklist_listen_matches clm ON clm.checklist_id = ca.id
+        LEFT JOIN listen_events le ON le.event_id = clm.event_id
+        LEFT JOIN album_tracklist at
+            ON LOWER(at.raw_artist) = LOWER(ca.artist)
+            AND LOWER(at.raw_album) = LOWER(ca.album)
+        LEFT JOIN (
+            SELECT raw_artist, raw_album,
+                   COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
+                   COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
+            FROM album_sessions
+            GROUP BY raw_artist, raw_album
+        ) sess ON LOWER(sess.raw_artist) = LOWER(ca.artist)
+              AND LOWER(sess.raw_album) = LOWER(ca.album)
+        {where}
+        GROUP BY ca.id, ca.artist, ca.album, ca.year, at.track_count,
+                 sess.full_sessions, sess.partial_sessions
+        {having}
+        ORDER BY {order}
+        LIMIT ${limit_idx} OFFSET ${offset_idx}
+    """, *params)
+
+    # Fetch sources for returned albums
+    if rows:
+        album_ids = [r["id"] for r in rows]
+        source_rows = await fetch(
+            "SELECT checklist_id, source, rank, genre, tier FROM checklist_sources WHERE checklist_id = ANY($1)",
+            album_ids,
+        )
+        source_map: dict[int, list[dict]] = {}
+        for sr in source_rows:
+            source_map.setdefault(sr["checklist_id"], []).append({
+                "source": sr["source"], "rank": sr["rank"],
+                "genre": sr["genre"], "tier": sr["tier"],
+            })
+    else:
+        source_map = {}
+
+    results = []
+    for r in rows:
+        row_dict = dict(r)
+        row_dict["sources"] = source_map.get(r["id"], [])
+        if row_dict.get("first_listen"):
+            row_dict["first_listen"] = row_dict["first_listen"].isoformat()
+        else:
+            row_dict["first_listen"] = None
+        if row_dict.get("last_listen"):
+            row_dict["last_listen"] = row_dict["last_listen"].isoformat()
+        else:
+            row_dict["last_listen"] = None
+        row_dict.pop("priority", None)
+        results.append(row_dict)
+
+    if format == "compact":
+        from src.formatters import compact_checklist
+        return PlainTextResponse(compact_checklist(results))
+    return {"albums": results, "count": len(results), "filters": {
+        "source": source, "heard": heard, "artist": artist,
+        "year_min": year_min, "year_max": year_max, "sort": sort,
+    }}
+
+
+@app.get("/api/checklist/gaps")
+async def checklist_gaps(
+    source: Optional[str] = None,
+    artist: Optional[str] = None,
+    year_min: Optional[int] = None,
+    year_max: Optional[int] = None,
+    limit: int = Query(default=50, le=500),
+    offset: int = Query(default=0, ge=0),
+    format: str = Query(default="compact", pattern="^(compact|json)$"),
+    _=Depends(verify_key),
+):
+    """Unheard checklist albums, sorted by priority (highly ranked on multiple lists first)."""
+    clauses = []
+    params = []
+
+    if source:
+        params.append(source)
+        clauses.append(f"cs.source = ${len(params)}")
+    if artist:
+        params.append(f"%{artist}%")
+        clauses.append(f"LOWER(ca.artist) LIKE LOWER(${len(params)})")
+    if year_min:
+        params.append(year_min)
+        clauses.append(f"ca.year >= ${len(params)}")
+    if year_max:
+        params.append(year_max)
+        clauses.append(f"ca.year <= ${len(params)}")
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.extend([limit, offset])
+    limit_idx = len(params) - 1
+    offset_idx = len(params)
+
+    rows = await fetch(f"""
+        SELECT
+            ca.id, ca.artist, ca.album, ca.year,
+            SUM(1.0 / COALESCE(cs.rank, 500)) AS priority
+        FROM checklist_albums ca
+        JOIN checklist_sources cs ON cs.checklist_id = ca.id
+        LEFT JOIN checklist_listen_matches clm ON clm.checklist_id = ca.id
+        {where}
+        GROUP BY ca.id, ca.artist, ca.album, ca.year
+        HAVING COUNT(clm.event_id) = 0
+        ORDER BY priority DESC, ca.year NULLS LAST
+        LIMIT ${limit_idx} OFFSET ${offset_idx}
+    """, *params)
+
+    # Fetch sources
+    if rows:
+        album_ids = [r["id"] for r in rows]
+        source_rows = await fetch(
+            "SELECT checklist_id, source, rank, genre, tier FROM checklist_sources WHERE checklist_id = ANY($1)",
+            album_ids,
+        )
+        source_map: dict[int, list[dict]] = {}
+        for sr in source_rows:
+            source_map.setdefault(sr["checklist_id"], []).append({
+                "source": sr["source"], "rank": sr["rank"],
+                "genre": sr["genre"], "tier": sr["tier"],
+            })
+    else:
+        source_map = {}
+
+    results = []
+    for r in rows:
+        row_dict = dict(r)
+        row_dict["sources"] = source_map.get(r["id"], [])
+        row_dict.pop("priority", None)
+        results.append(row_dict)
+
+    if format == "compact":
+        from src.formatters import compact_checklist_gaps
+        return PlainTextResponse(compact_checklist_gaps(results))
+    return {"albums": results, "count": len(results), "filters": {
+        "source": source, "artist": artist,
+        "year_min": year_min, "year_max": year_max,
+    }}
+
+
+@app.get("/api/checklist/stats")
+async def checklist_stats(_=Depends(verify_key)):
+    """Summary: total albums, heard/unheard per source, overlap counts."""
+    total = await fetchval("SELECT COUNT(*) FROM checklist_albums")
+
+    by_source = await fetch("""
+        SELECT cs.source,
+               COUNT(DISTINCT cs.checklist_id) AS total,
+               COUNT(DISTINCT cs.checklist_id) FILTER (
+                   WHERE EXISTS (SELECT 1 FROM checklist_listen_matches clm WHERE clm.checklist_id = cs.checklist_id)
+               ) AS heard
+        FROM checklist_sources cs
+        GROUP BY cs.source
+        ORDER BY cs.source
+    """)
+
+    heard_total = await fetchval("""
+        SELECT COUNT(DISTINCT ca.id)
+        FROM checklist_albums ca
+        WHERE EXISTS (SELECT 1 FROM checklist_listen_matches clm WHERE clm.checklist_id = ca.id)
+    """)
+
+    overlap = await fetch("""
+        SELECT source_count, COUNT(*) AS albums
+        FROM (
+            SELECT checklist_id, COUNT(DISTINCT source) AS source_count
+            FROM checklist_sources
+            GROUP BY checklist_id
+        ) sub
+        WHERE source_count > 1
+        GROUP BY source_count
+        ORDER BY source_count
+    """)
+
+    return {
+        "total_albums": total or 0,
+        "total_heard": heard_total or 0,
+        "total_unheard": (total or 0) - (heard_total or 0),
+        "by_source": [
+            {"source": r["source"], "total": r["total"], "heard": r["heard"], "unheard": r["total"] - r["heard"]}
+            for r in by_source
+        ],
+        "overlap": [{"on_n_lists": r["source_count"], "albums": r["albums"]} for r in overlap],
+    }
+
+
+@app.post("/api/checklist")
+async def add_to_checklist(body: ChecklistAddRequest, _=Depends(verify_key)):
+    """Add albums to checklist (by Claude or user)."""
+    added = 0
+    for alb in body.albums:
+        artist = alb.get("artist", "").strip()
+        album = alb.get("album", "").strip()
+        if not artist or not album:
+            continue
+        year = alb.get("year")
+
+        row = await fetchrow(
+            """INSERT INTO checklist_albums (artist, album, year)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (artist, album) DO NOTHING
+               RETURNING id""",
+            artist, album, year,
+        )
+        checklist_id = row["id"] if row else await fetchval(
+            "SELECT id FROM checklist_albums WHERE artist = $1 AND album = $2",
+            artist, album,
+        )
+        if checklist_id:
+            await execute(
+                """INSERT INTO checklist_sources (checklist_id, source)
+                   VALUES ($1, $2)
+                   ON CONFLICT (checklist_id, source) DO NOTHING""",
+                checklist_id, body.source,
+            )
+            added += 1
+
+    return {"added": added, "source": body.source}
+
+
+@app.delete("/api/checklist/{album_id}")
+async def delete_from_checklist(album_id: int, _=Depends(verify_key)):
+    """Remove album from checklist (cascades to sources + matches)."""
+    result = await execute("DELETE FROM checklist_albums WHERE id = $1", album_id)
+    if result == "DELETE 0":
+        raise HTTPException(404, "Album not found")
+    return {"deleted": True, "id": album_id}
+
+
+@app.post("/api/checklist/matches/refresh")
+async def refresh_checklist_matches(_=Depends(verify_key)):
+    """Re-match all checklist albums to listen events (two-pass normalized matching)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("TRUNCATE checklist_listen_matches")
+
+        # Pass 1: exact normalized match
+        result1 = await conn.execute("""
+            INSERT INTO checklist_listen_matches (checklist_id, event_id, match_method)
+            SELECT DISTINCT ca.id, le.event_id, 'normalized'
+            FROM checklist_albums ca
+            JOIN listen_events le
+                ON normalize_artist(le.raw_artist) = normalize_artist(ca.artist)
+                AND normalize_album(le.raw_album) = normalize_album(ca.album)
+            ON CONFLICT DO NOTHING
+        """)
+        pass1 = int(result1.split()[-1]) if result1 else 0
+
+        # Pass 2: loose normalized match (strip all parentheticals)
+        result2 = await conn.execute("""
+            INSERT INTO checklist_listen_matches (checklist_id, event_id, match_method)
+            SELECT DISTINCT ca.id, le.event_id, 'normalized_loose'
+            FROM checklist_albums ca
+            JOIN listen_events le
+                ON normalize_artist(le.raw_artist) = normalize_artist(ca.artist)
+                AND normalize_album_loose(le.raw_album) = normalize_album_loose(ca.album)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM checklist_listen_matches clm
+                WHERE clm.checklist_id = ca.id AND clm.event_id = le.event_id
+            )
+            ON CONFLICT DO NOTHING
+        """)
+        pass2 = int(result2.split()[-1]) if result2 else 0
+
+        stats = await conn.fetchrow("""
+            SELECT
+                COUNT(DISTINCT checklist_id) AS matched_albums,
+                COUNT(*) AS total_matches,
+                COUNT(DISTINCT event_id) AS matched_events
+            FROM checklist_listen_matches
+        """)
+        total_albums = await conn.fetchval("SELECT COUNT(*) FROM checklist_albums")
+
+    return {
+        "status": "ok",
+        "pass1_normalized": pass1,
+        "pass2_loose": pass2,
+        "total_matches": stats["total_matches"],
+        "matched_albums": stats["matched_albums"],
+        "total_albums": total_albums,
+        "unmatched_albums": total_albums - stats["matched_albums"],
+        "matched_events": stats["matched_events"],
+    }
+
+
+@app.post("/api/checklist/resolve")
+async def resolve_checklist(body: dict = {}, _=Depends(verify_key)):
+    """Resolve unresolved checklist albums via MusicBrainz (+ optional Last.fm fallback).
+
+    Body: {"lastfm_fallback": true} to also run Last.fm after MusicBrainz.
+    Warning: MusicBrainz resolution runs at 1 req/sec. May take 30+ min for large batches.
+    """
+    mb_result = await resolve_checklist_missing()
+
+    lastfm_result = None
+    if body and body.get("lastfm_fallback"):
+        lastfm_result = await resolve_checklist_missing_lastfm()
+
+    return {
+        "musicbrainz": mb_result,
+        "lastfm": lastfm_result,
     }
 
 

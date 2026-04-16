@@ -302,6 +302,64 @@ async def resolve_all_missing() -> dict:
     }
 
 
+async def resolve_checklist_missing() -> dict:
+    """Resolve all checklist albums that aren't in album_tracklist."""
+    unresolved = await fetch("""
+        SELECT DISTINCT ca.artist AS raw_artist, ca.album AS raw_album
+        FROM checklist_albums ca
+        LEFT JOIN album_tracklist at
+            ON LOWER(at.raw_artist) = LOWER(ca.artist)
+            AND LOWER(at.raw_album) = LOWER(ca.album)
+        WHERE at.raw_artist IS NULL
+        ORDER BY ca.artist, ca.album
+    """)
+
+    resolved = 0
+    failed = 0
+    failures = []
+
+    async with httpx.AsyncClient(
+        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+        timeout=30,
+    ) as client:
+        for row in unresolved:
+            artist = row["raw_artist"]
+            album = row["raw_album"]
+
+            await asyncio.sleep(1.1)  # Rate limit
+            result = await resolve_album_tracklist(client, artist, album)
+
+            if result is not None:
+                track_count, release_type = result
+                await execute(
+                    """INSERT INTO album_tracklist (raw_artist, raw_album, track_count, release_type, source, resolved_at)
+                       VALUES ($1, $2, $3, $4, 'musicbrainz', $5)
+                       ON CONFLICT (raw_artist, raw_album)
+                       DO UPDATE SET track_count = $3, release_type = $4, resolved_at = $5""",
+                    artist, album, track_count, release_type, datetime.now(timezone.utc),
+                )
+                resolved += 1
+                logger.info(f"Checklist resolved: {artist} - {album} ({track_count} tracks, {release_type})")
+            else:
+                await execute(
+                    """INSERT INTO album_tracklist (raw_artist, raw_album, track_count, release_type, source, resolved_at, resolution_notes)
+                       VALUES ($1, $2, 0, 'unknown', 'unresolvable', $3, 'No match in MusicBrainz')
+                       ON CONFLICT (raw_artist, raw_album) DO NOTHING""",
+                    artist, album, datetime.now(timezone.utc),
+                )
+                failed += 1
+                failures.append({"raw_artist": artist, "raw_album": album, "error": "No match found"})
+                logger.warning(f"Checklist failed (tombstoned): {artist} - {album}")
+
+    return {
+        "source": "checklist",
+        "total_unresolved": len(unresolved),
+        "resolved": resolved,
+        "failed": failed,
+        "failures": failures[:50],
+    }
+
+
 async def get_resolution_status() -> dict:
     """Check how many albums are resolved vs unresolved."""
     total = await fetchval("""
