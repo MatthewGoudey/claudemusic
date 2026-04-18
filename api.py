@@ -139,6 +139,11 @@ async def startup():
                 normalize_artist(artist), normalize_album(album)
             )
         """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_album_tracklist_norm ON album_tracklist(
+                normalize_artist(raw_artist), normalize_album(raw_album)
+            )
+        """)
 
 
 @app.on_event("shutdown")
@@ -576,8 +581,8 @@ async def top_albums(
                    COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
             FROM album_sessions
             GROUP BY raw_artist, raw_album
-        ) s ON LOWER(s.raw_artist) = LOWER(e.raw_artist)
-           AND LOWER(s.raw_album) = LOWER(e.raw_album)
+        ) s ON normalize_artist(s.raw_artist) = normalize_artist(e.raw_artist)
+           AND normalize_album(s.raw_album) = normalize_album(e.raw_album)
         {where}
         GROUP BY e.raw_album, e.raw_artist, s.full_sessions, s.partial_sessions
         ORDER BY listen_count DESC
@@ -736,16 +741,16 @@ async def artist_detail(artist_name: str, _=Depends(verify_key)):
             COALESCE(s.partial_sessions, 0)::int AS partial_sessions
         FROM listen_events le
         LEFT JOIN album_tracklist at
-            ON LOWER(at.raw_artist) = LOWER(le.raw_artist)
-            AND LOWER(at.raw_album) = LOWER(le.raw_album)
+            ON normalize_artist(at.raw_artist) = normalize_artist(le.raw_artist)
+            AND normalize_album(at.raw_album) = normalize_album(le.raw_album)
         LEFT JOIN (
             SELECT raw_artist, raw_album,
                    COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
                    COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
             FROM album_sessions
             GROUP BY raw_artist, raw_album
-        ) s ON LOWER(s.raw_artist) = LOWER(le.raw_artist)
-           AND LOWER(s.raw_album) = LOWER(le.raw_album)
+        ) s ON normalize_artist(s.raw_artist) = normalize_artist(le.raw_artist)
+           AND normalize_album(s.raw_album) = normalize_album(le.raw_album)
         WHERE LOWER(le.raw_artist) = LOWER($1)
           AND le.raw_album IS NOT NULL
         GROUP BY le.raw_album, at.track_count, at.release_type, s.full_sessions, s.partial_sessions
@@ -825,8 +830,8 @@ async def album_completion(
             COALESCE(s.partial_sessions, 0)::int AS partial_sessions
         FROM listen_events le
         JOIN album_tracklist at
-            ON LOWER(at.raw_artist) = LOWER(le.raw_artist)
-            AND LOWER(at.raw_album) = LOWER(le.raw_album)
+            ON normalize_artist(at.raw_artist) = normalize_artist(le.raw_artist)
+            AND normalize_album(at.raw_album) = normalize_album(le.raw_album)
             AND at.track_count > 0
             AND COALESCE(at.quality_flag, '') != 'box_set_suspect'
         LEFT JOIN (
@@ -835,8 +840,8 @@ async def album_completion(
                    COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
             FROM album_sessions
             GROUP BY raw_artist, raw_album
-        ) s ON LOWER(s.raw_artist) = LOWER(le.raw_artist)
-           AND LOWER(s.raw_album) = LOWER(le.raw_album)
+        ) s ON normalize_artist(s.raw_artist) = normalize_artist(le.raw_artist)
+           AND normalize_album(s.raw_album) = normalize_album(le.raw_album)
         {where}
         GROUP BY le.raw_artist, le.raw_album, at.track_count, at.release_type, at.source,
                  s.full_sessions, s.partial_sessions
@@ -1031,16 +1036,16 @@ async def revisit_candidates(
             COALESCE(s.partial_sessions, 0)::int AS partial_sessions
         FROM listen_events le
         LEFT JOIN album_tracklist at
-            ON LOWER(at.raw_artist) = LOWER(le.raw_artist)
-            AND LOWER(at.raw_album) = LOWER(le.raw_album)
+            ON normalize_artist(at.raw_artist) = normalize_artist(le.raw_artist)
+            AND normalize_album(at.raw_album) = normalize_album(le.raw_album)
         LEFT JOIN (
             SELECT raw_artist, raw_album,
                    COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
                    COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
             FROM album_sessions
             GROUP BY raw_artist, raw_album
-        ) s ON LOWER(s.raw_artist) = LOWER(le.raw_artist)
-           AND LOWER(s.raw_album) = LOWER(le.raw_album)
+        ) s ON normalize_artist(s.raw_artist) = normalize_artist(le.raw_artist)
+           AND normalize_album(s.raw_album) = normalize_album(le.raw_album)
         WHERE le.raw_album IS NOT NULL
         GROUP BY le.raw_artist, le.raw_album, at.track_count, at.release_type,
                  s.full_sessions, s.partial_sessions
@@ -1307,7 +1312,7 @@ async def chicago_shows(
     genre_join = ""
     if genre:
         idx = len(params) + 1
-        genre_join = "JOIN artist_tags at ON at.norm_artist = normalize_artist(cs.artist_name)"
+        genre_join = "JOIN artist_tags at ON at.norm_artist = normalize_artist(COALESCE(cs.clean_headliner, cs.artist_name))"
         clauses.append(f"LOWER(at.tag) LIKE LOWER(${idx})")
         params.append(f"%{genre}%")
 
@@ -1449,7 +1454,7 @@ async def chicago_match(
     genre_join = ""
     if genre:
         params.append(f"%{genre}%")
-        genre_join = f"JOIN artist_tags gt ON gt.norm_artist = normalize_artist(cs.artist_name) AND LOWER(gt.tag) LIKE LOWER(${len(params)})"
+        genre_join = f"JOIN artist_tags gt ON gt.norm_artist = normalize_artist(COALESCE(cs.clean_headliner, cs.artist_name)) AND LOWER(gt.tag) LIKE LOWER(${len(params)})"
 
     if festival:
         params.append(f"%{festival}%")
@@ -1474,7 +1479,7 @@ async def chicago_match(
                    cs.age_restriction, cs.sources, cs.presale_name, cs.presale_start,
                    cs.presale_end, cs.onsale_date, cs.festival_name,
                    cs.status, cs.first_seen, cs.last_verified,
-                   normalize_artist(cs.artist_name) AS norm_artist
+                   normalize_artist(COALESCE(cs.clean_headliner, cs.artist_name)) AS norm_artist
             FROM chicago_shows cs
             {genre_join}
             {where}
@@ -1755,13 +1760,13 @@ async def discover(
             all_norms = [norm_seed] + similar_norms
             show_rows = await conn.fetch("""
                 SELECT
-                    normalize_artist(cs.artist_name) AS norm_artist,
+                    normalize_artist(COALESCE(cs.clean_headliner, cs.artist_name)) AS norm_artist,
                     cs.show_id, cs.artist_name, cs.venue_name, cs.show_date,
                     cs.show_time, cs.ticket_url, cs.festival_name, cs.status,
                     v.travel_best_min, v.travel_driving_min, v.travel_transit_min
                 FROM chicago_shows cs
                 LEFT JOIN venues v ON LOWER(v.venue_name) = LOWER(cs.venue_name)
-                WHERE normalize_artist(cs.artist_name) = ANY($1)
+                WHERE normalize_artist(COALESCE(cs.clean_headliner, cs.artist_name)) = ANY($1)
                   AND cs.show_date >= CURRENT_DATE
                   AND cs.status = 'upcoming'
                 ORDER BY cs.show_date ASC
@@ -2162,8 +2167,8 @@ async def canonical_gaps(
                    COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
             FROM album_sessions
             GROUP BY raw_artist, raw_album
-        ) s ON LOWER(s.raw_artist) = LOWER(ca.artist)
-           AND LOWER(s.raw_album) = LOWER(ca.album)
+        ) s ON normalize_artist(s.raw_artist) = normalize_artist(ca.artist)
+           AND normalize_album(s.raw_album) = normalize_album(ca.album)
         {where}
         GROUP BY ca.id, ca.artist, ca.album, ca.year, ca.genre, ca.subgenre, ca.tier, ca.description,
                  s.full_sessions, s.partial_sessions
@@ -2285,16 +2290,16 @@ async def checklist(
         LEFT JOIN checklist_listen_matches clm ON clm.checklist_id = ca.id
         LEFT JOIN listen_events le ON le.event_id = clm.event_id
         LEFT JOIN album_tracklist at
-            ON LOWER(at.raw_artist) = LOWER(ca.artist)
-            AND LOWER(at.raw_album) = LOWER(ca.album)
+            ON normalize_artist(at.raw_artist) = normalize_artist(ca.artist)
+            AND normalize_album(at.raw_album) = normalize_album(ca.album)
         LEFT JOIN (
             SELECT raw_artist, raw_album,
                    COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
                    COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
             FROM album_sessions
             GROUP BY raw_artist, raw_album
-        ) sess ON LOWER(sess.raw_artist) = LOWER(ca.artist)
-              AND LOWER(sess.raw_album) = LOWER(ca.album)
+        ) sess ON normalize_artist(sess.raw_artist) = normalize_artist(ca.artist)
+              AND normalize_album(sess.raw_album) = normalize_album(ca.album)
         {where}
         GROUP BY ca.id, ca.artist, ca.album, ca.year, at.track_count,
                  sess.full_sessions, sess.partial_sessions

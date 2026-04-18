@@ -18,6 +18,12 @@ CREATE TABLE IF NOT EXISTS album_tracklist (
 CREATE INDEX IF NOT EXISTS idx_album_tracklist_lower
     ON album_tracklist (LOWER(raw_artist), LOWER(raw_album));
 
+-- Functional index on normalize_artist/normalize_album for JOINs in
+-- /album-completion, /checklist, /canonical/gaps. Must be created after
+-- the normalize_artist and normalize_album functions exist.
+CREATE INDEX IF NOT EXISTS idx_album_tracklist_norm
+    ON album_tracklist (normalize_artist(raw_artist), normalize_album(raw_album));
+
 -- Read-only role for /api/query endpoint security
 -- Run these as a superuser/owner:
 --
