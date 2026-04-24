@@ -1,6 +1,6 @@
 """
 Controlled genre vocabulary for canonical_albums.
-122 genres organized by family. Family is for human readability only — not stored in DB.
+124 genres organized by family. Family is for human readability only — not stored in DB.
 Only the genre string goes in the `genre` column. Subgenre is free-text.
 """
 
@@ -91,6 +91,8 @@ CANONICAL_GENRES: list[str] = [
     "Traditional Country",
     "Outlaw Country",
     "Country Rock",
+    "Southern Rock",
+    "Alt-Country",
     "Americana",
     "Bluegrass",
     "Traditional Folk",

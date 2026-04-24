@@ -13,7 +13,7 @@
 
 ## Controlled Genre Vocabulary
 
-122 genres organized by family. The **Family** column is for human navigation only — it is NOT stored in the database. Only **Genre** goes in the `genre` column.
+124 genres organized by family. The **Family** column is for human navigation only — it is NOT stored in the database. Only **Genre** goes in the `genre` column.
 
 ### Hip-Hop
 | Genre | Notes |
@@ -118,13 +118,15 @@
 ### Country & Folk
 | Genre | Notes |
 |---|---|
-| Traditional Country | Hank, Patsy, Merle, honky-tonk, Nashville sound |
-| Outlaw Country | Waylon, Willie, Kristofferson, Townes |
-| Country Rock | Cosmic country, California country rock, Gram Parsons |
-| Americana | Alt-country, roots rock, gothic Americana, modern Americana |
-| Bluegrass | Monroe through Punch Brothers, progressive bluegrass |
+| Traditional Country | Hank, Patsy, Merle, honky-tonk revival (Joshua Hedley, Luke Bell), Nashville sound |
+| Outlaw Country | Waylon, Willie, Kristofferson, Townes, Blaze Foley; revival outlaws (Colter Wall, Nick Shoulders) |
+| Country Rock | Cosmic country, California country rock, Gram Parsons, CCR, Chris Stapleton |
+| Southern Rock | Allman Brothers, Skynyrd, Marshall Tucker, Black Crowes, Gov't Mule, North Mississippi Allstars |
+| Alt-Country | Uncle Tupelo lineage: Wilco, Son Volt, Whiskeytown, Lucinda, Isbell, DBT, Sturgill, Ryan Adams, Drive-By Truckers, Waxahatchee; countrygaze (MJ Lenderman, Wednesday, Fust) |
+| Americana | Roots-rock umbrella that sits adjacent to alt-country but doesn't fit it: Mary Gauthier, The Delines, Ryan Bingham, Mermaid Avenue, Courtney Marie Andrews, MMJ |
+| Bluegrass | Monroe through Punch Brothers, progressive bluegrass, newgrass (Watchhouse, SteelDrivers, Bella White) |
 | Traditional Folk | Revival folk, protest folk, British folk |
-| Singer-Songwriter | Modern indie folk, confessional, Bon Iver through Phoebe Bridgers |
+| Singer-Songwriter | Modern indie folk, confessional, Bon Iver through Phoebe Bridgers; also John Prine, Mary Gauthier, John Moreland |
 
 ### Jazz
 | Genre | Notes |
