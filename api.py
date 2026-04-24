@@ -2227,13 +2227,19 @@ async def checklist(
     format: str = Query(default="compact", pattern="^(compact|json)$"),
     _=Depends(verify_key),
 ):
-    """Browse checklist albums with listen stats, session counts, and source info."""
+    """Browse checklist albums with listen stats, session counts, and source info.
+
+    Pre-aggregates each feed (listen_matches, sources, tracklist, sessions) into
+    CTEs so joins to checklist_albums are 1:1 — no fan-out inflation when an
+    album has multiple sources, multiple tracklist edition variants, or split
+    session rows.
+    """
     clauses = []
     params = []
 
     if source:
         params.append(source)
-        clauses.append(f"cs.source = ${len(params)}")
+        clauses.append(f"EXISTS (SELECT 1 FROM checklist_sources csf WHERE csf.checklist_id = ca.id AND csf.source = ${len(params)})")
     if artist:
         params.append(f"%{artist}%")
         clauses.append(f"LOWER(ca.artist) LIKE LOWER(${len(params)})")
@@ -2243,26 +2249,22 @@ async def checklist(
     if year_max:
         params.append(year_max)
         clauses.append(f"ca.year <= ${len(params)}")
-
-    tag_join = ""
     if tag:
         params.append(f"%{tag}%")
-        tag_join = f"JOIN artist_tags agt ON agt.norm_artist = normalize_artist(ca.artist) AND LOWER(agt.tag) LIKE LOWER(${len(params)})"
+        clauses.append(f"EXISTS (SELECT 1 FROM artist_tags agt WHERE agt.norm_artist = normalize_artist(ca.artist) AND LOWER(agt.tag) LIKE LOWER(${len(params)}))")
+
+    if heard == "true":
+        clauses.append("COALESCE(la.listen_count, 0) > 0")
+    elif heard == "false":
+        clauses.append("COALESCE(la.listen_count, 0) = 0")
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
-    # heard filter as HAVING
-    having = ""
-    if heard == "true":
-        having = "HAVING COUNT(clm.event_id) > 0"
-    elif heard == "false":
-        having = "HAVING COUNT(clm.event_id) = 0"
-
     sort_map = {
-        "priority": "priority DESC, ca.year NULLS LAST",
+        "priority": "src.priority DESC, ca.year NULLS LAST",
         "year": "ca.year NULLS LAST, ca.artist",
         "artist": "ca.artist, ca.year NULLS LAST",
-        "recent": "MAX(le.listened_at) DESC NULLS LAST",
+        "recent": "la.last_listen DESC NULLS LAST",
     }
     order = sort_map[sort]
 
@@ -2271,39 +2273,61 @@ async def checklist(
     offset_idx = len(params)
 
     rows = await fetch(f"""
+        WITH listen_agg AS (
+            SELECT clm.checklist_id,
+                   COUNT(DISTINCT clm.event_id)::int AS listen_count,
+                   COUNT(DISTINCT le.raw_title)::int AS unique_tracks,
+                   MIN(le.listened_at) AS first_listen,
+                   MAX(le.listened_at) AS last_listen
+            FROM checklist_listen_matches clm
+            LEFT JOIN listen_events le ON le.event_id = clm.event_id
+            GROUP BY clm.checklist_id
+        ),
+        source_agg AS (
+            SELECT checklist_id,
+                   SUM(1.0 / COALESCE(rank, 500)) AS priority
+            FROM checklist_sources
+            GROUP BY checklist_id
+        ),
+        tracklist_agg AS (
+            SELECT normalize_artist(raw_artist) AS na,
+                   normalize_album(raw_album) AS nb,
+                   MIN(track_count) AS track_count
+            FROM album_tracklist
+            WHERE track_count IS NOT NULL AND track_count > 0
+            GROUP BY normalize_artist(raw_artist), normalize_album(raw_album)
+        ),
+        session_agg AS (
+            SELECT normalize_artist(raw_artist) AS na,
+                   normalize_album(raw_album) AS nb,
+                   COUNT(*) FILTER (WHERE session_type = 'full')::int AS full_sessions,
+                   COUNT(*) FILTER (WHERE session_type = 'partial')::int AS partial_sessions
+            FROM album_sessions
+            GROUP BY normalize_artist(raw_artist), normalize_album(raw_album)
+        )
         SELECT
             ca.id, ca.artist, ca.album, ca.year,
-            COUNT(clm.event_id)::int AS listen_count,
-            COUNT(DISTINCT le.raw_title)::int AS unique_tracks,
-            MIN(le.listened_at) AS first_listen,
-            MAX(le.listened_at) AS last_listen,
-            COALESCE(at.track_count, 0) AS total_tracks,
-            CASE WHEN at.track_count > 0
-                 THEN ROUND(COUNT(DISTINCT le.raw_title)::numeric / at.track_count, 2)
+            COALESCE(la.listen_count, 0) AS listen_count,
+            COALESCE(la.unique_tracks, 0) AS unique_tracks,
+            la.first_listen,
+            la.last_listen,
+            COALESCE(ta.track_count, 0) AS total_tracks,
+            CASE WHEN ta.track_count > 0
+                 THEN ROUND(COALESCE(la.unique_tracks, 0)::numeric / ta.track_count, 2)
                  ELSE 0.0 END AS completion,
-            COALESCE(sess.full_sessions, 0)::int AS full_sessions,
-            COALESCE(sess.partial_sessions, 0)::int AS partial_sessions,
-            SUM(1.0 / COALESCE(cs.rank, 500)) AS priority
+            COALESCE(sa.full_sessions, 0) AS full_sessions,
+            COALESCE(sa.partial_sessions, 0) AS partial_sessions,
+            COALESCE(src.priority, 0) AS priority
         FROM checklist_albums ca
-        JOIN checklist_sources cs ON cs.checklist_id = ca.id
-        {tag_join}
-        LEFT JOIN checklist_listen_matches clm ON clm.checklist_id = ca.id
-        LEFT JOIN listen_events le ON le.event_id = clm.event_id
-        LEFT JOIN album_tracklist at
-            ON normalize_artist(at.raw_artist) = normalize_artist(ca.artist)
-            AND normalize_album(at.raw_album) = normalize_album(ca.album)
-        LEFT JOIN (
-            SELECT raw_artist, raw_album,
-                   COUNT(*) FILTER (WHERE session_type = 'full') AS full_sessions,
-                   COUNT(*) FILTER (WHERE session_type = 'partial') AS partial_sessions
-            FROM album_sessions
-            GROUP BY raw_artist, raw_album
-        ) sess ON normalize_artist(sess.raw_artist) = normalize_artist(ca.artist)
-              AND normalize_album(sess.raw_album) = normalize_album(ca.album)
+        JOIN source_agg src ON src.checklist_id = ca.id
+        LEFT JOIN listen_agg la ON la.checklist_id = ca.id
+        LEFT JOIN tracklist_agg ta
+            ON ta.na = normalize_artist(ca.artist)
+            AND ta.nb = normalize_album(ca.album)
+        LEFT JOIN session_agg sa
+            ON sa.na = normalize_artist(ca.artist)
+            AND sa.nb = normalize_album(ca.album)
         {where}
-        GROUP BY ca.id, ca.artist, ca.album, ca.year, at.track_count,
-                 sess.full_sessions, sess.partial_sessions
-        {having}
         ORDER BY {order}
         LIMIT ${limit_idx} OFFSET ${offset_idx}
     """, *params)
@@ -2360,13 +2384,17 @@ async def checklist_gaps(
     format: str = Query(default="compact", pattern="^(compact|json)$"),
     _=Depends(verify_key),
 ):
-    """Unheard checklist albums, sorted by priority (highly ranked on multiple lists first)."""
+    """Unheard checklist albums, sorted by priority (highly ranked on multiple lists first).
+
+    Pre-aggregates sources and listen_matches into CTEs so joins are 1:1 — prevents
+    tag-filter and source-filter fan-out from inflating priority.
+    """
     clauses = []
     params = []
 
     if source:
         params.append(source)
-        clauses.append(f"cs.source = ${len(params)}")
+        clauses.append(f"EXISTS (SELECT 1 FROM checklist_sources csf WHERE csf.checklist_id = ca.id AND csf.source = ${len(params)})")
     if artist:
         params.append(f"%{artist}%")
         clauses.append(f"LOWER(ca.artist) LIKE LOWER(${len(params)})")
@@ -2376,29 +2404,31 @@ async def checklist_gaps(
     if year_max:
         params.append(year_max)
         clauses.append(f"ca.year <= ${len(params)}")
-
-    tag_join = ""
     if tag:
         params.append(f"%{tag}%")
-        tag_join = f"JOIN artist_tags agt ON agt.norm_artist = normalize_artist(ca.artist) AND LOWER(agt.tag) LIKE LOWER(${len(params)})"
+        clauses.append(f"EXISTS (SELECT 1 FROM artist_tags agt WHERE agt.norm_artist = normalize_artist(ca.artist) AND LOWER(agt.tag) LIKE LOWER(${len(params)}))")
 
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    clauses.append("NOT EXISTS (SELECT 1 FROM checklist_listen_matches clm WHERE clm.checklist_id = ca.id)")
+
+    where = "WHERE " + " AND ".join(clauses)
     params.extend([limit, offset])
     limit_idx = len(params) - 1
     offset_idx = len(params)
 
     rows = await fetch(f"""
+        WITH source_agg AS (
+            SELECT checklist_id,
+                   SUM(1.0 / COALESCE(rank, 500)) AS priority
+            FROM checklist_sources
+            GROUP BY checklist_id
+        )
         SELECT
             ca.id, ca.artist, ca.album, ca.year,
-            SUM(1.0 / COALESCE(cs.rank, 500)) AS priority
+            COALESCE(src.priority, 0) AS priority
         FROM checklist_albums ca
-        JOIN checklist_sources cs ON cs.checklist_id = ca.id
-        {tag_join}
-        LEFT JOIN checklist_listen_matches clm ON clm.checklist_id = ca.id
+        JOIN source_agg src ON src.checklist_id = ca.id
         {where}
-        GROUP BY ca.id, ca.artist, ca.album, ca.year
-        HAVING COUNT(clm.event_id) = 0
-        ORDER BY priority DESC, ca.year NULLS LAST
+        ORDER BY src.priority DESC, ca.year NULLS LAST
         LIMIT ${limit_idx} OFFSET ${offset_idx}
     """, *params)
 
